@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+from typing import Callable
+
+from agent_sentinel.config import Settings
+from agent_sentinel.feishu_app import FeishuBotClient, extract_text_from_message_content
+
+logger = logging.getLogger(__name__)
+
+
+AnalyzeCallback = Callable[
+    [str, str, str, str, str | None, str | None, str, list[str] | None, str | None, str | None, str | None],
+    tuple[str, bool],
+]
+
+
+class FeishuMessagePoller:
+    def __init__(
+        self,
+        settings: Settings,
+        feishu_bot_client: FeishuBotClient,
+        analyze_callback: AnalyzeCallback,
+    ) -> None:
+        self.settings = settings
+        self.feishu_bot_client = feishu_bot_client
+        self.analyze_callback = analyze_callback
+        self._thread: threading.Thread | None = None
+        self._started = False
+        self._seen_message_ids: set[str] = set()
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        if self._started:
+            return
+        if not self.settings.feishu_message_polling_enabled:
+            logger.info("Feishu message polling is disabled.")
+            return
+        if not self.settings.feishu_allowed_chat_ids:
+            logger.warning("Feishu message polling skipped because FEISHU_ALLOWED_CHAT_IDS is empty.")
+            return
+        if not self.feishu_bot_client.is_configured():
+            logger.warning("Feishu message polling skipped because app credentials are missing.")
+            return
+
+        self._thread = threading.Thread(
+            target=self._run_forever,
+            name="feishu-message-poller",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started = True
+
+    def _run_forever(self) -> None:
+        interval = max(self.settings.feishu_message_polling_interval_seconds, 2)
+        logger.info("Starting Feishu message polling loop.")
+        while True:
+            try:
+                for chat_id in self.settings.feishu_allowed_chat_ids:
+                    self._poll_chat(chat_id)
+            except Exception:
+                logger.exception("Feishu message polling iteration failed")
+            time.sleep(interval)
+
+    def _poll_chat(self, chat_id: str) -> None:
+        items = self.feishu_bot_client.list_chat_messages(
+            chat_id,
+            page_size=max(self.settings.feishu_message_polling_page_size, 1),
+        )
+        for message in reversed(items):
+            self._handle_message(chat_id, message)
+
+    def _handle_message(self, chat_id: str, message: dict[str, object]) -> None:
+        message_id = str(message.get("message_id") or "")
+        if not message_id:
+            return
+        if self._already_seen(message_id):
+            return
+
+        if str(message.get("msg_type") or "") != "text":
+            return
+
+        sender = message.get("sender") or {}
+        if isinstance(sender, dict):
+            sender_type = str(sender.get("sender_type") or "")
+            if sender_type and sender_type != "user":
+                return
+
+        raw_content = message.get("body") or message.get("content") or ""
+        content_text = self._extract_text(raw_content)
+        if not content_text.strip():
+            return
+
+        mentions = message.get("mentions") or []
+        if self.settings.feishu_analyze_mention_only and not self._looks_like_bot_mention(content_text, mentions):
+            return
+
+        self.analyze_callback(
+            chat_id,
+            "feishu-user",
+            "INFO",
+            f"{self.settings.feishu_bot_name} received a polled message",
+            content_text,
+            content_text,
+            "user_message_polling",
+            ["feishu", "polling"],
+            str(message.get("root_id") or "") or message_id,
+            self._extract_sender_open_id(sender),
+            self._extract_sender_name(sender),
+        )
+
+    def _extract_text(self, raw_content: object) -> str:
+        if isinstance(raw_content, dict):
+            if "content" in raw_content:
+                return extract_text_from_message_content(str(raw_content.get("content") or ""))
+            return json.dumps(raw_content, ensure_ascii=False)
+        return extract_text_from_message_content(str(raw_content))
+
+    def _looks_like_bot_mention(self, content_text: str, mentions: object) -> bool:
+        bot_name = self.settings.feishu_bot_name.strip()
+        if isinstance(mentions, list):
+            for mention in mentions:
+                if not isinstance(mention, dict):
+                    continue
+                if str(mention.get("name") or "").strip() == bot_name:
+                    return True
+        return "<at " in content_text or (bot_name and bot_name in content_text)
+
+    def _extract_sender_open_id(self, sender: object) -> str | None:
+        if not isinstance(sender, dict):
+            return None
+        sender_id = str(sender.get("id") or "").strip()
+        sender_id_type = str(sender.get("id_type") or "").strip()
+        if sender_id and sender_id_type == "open_id":
+            return sender_id
+        return None
+
+    def _extract_sender_name(self, sender: object) -> str | None:
+        if not isinstance(sender, dict):
+            return None
+        name = str(sender.get("name") or "").strip()
+        return name or None
+
+    def _already_seen(self, message_id: str) -> bool:
+        with self._lock:
+            if message_id in self._seen_message_ids:
+                return True
+            self._seen_message_ids.add(message_id)
+            if len(self._seen_message_ids) > 1000:
+                self._seen_message_ids = set(list(self._seen_message_ids)[-500:])
+            return False
