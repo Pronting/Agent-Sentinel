@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -70,16 +70,29 @@ class Settings:
     alert_api_token: str | None
     alert_dedup_window_seconds: int
     alert_store_limit: int
+    aiops_workflow_config_path: str = "config/workflow.yaml"
+    aiops_llm_models: list[str] = field(default_factory=lambda: ["gpt-4o-mini"])
+    aiops_llm_timeout_seconds: int = 15
+    aiops_llm_max_retries: int = 2
+    aiops_mock_llm_enabled: bool = False
+    aiops_human_confirm_timeout_seconds: int = 300
+    aiops_human_confirm_enabled: bool = True
+    redis_url: str | None = None
 
 
 def get_settings() -> Settings:
     load_dotenv()
+    yaml_settings = _load_yaml_settings()
+    app_cfg = yaml_settings.get("app", {})
+    llm_cfg = yaml_settings.get("llm", {})
+    workflow_cfg = yaml_settings.get("workflow", {})
+    redis_cfg = yaml_settings.get("redis", {})
     return Settings(
-        app_name=os.getenv("APP_NAME", "Agent Sentinel"),
-        app_host=os.getenv("APP_HOST", "0.0.0.0"),
-        app_port=_to_int(os.getenv("APP_PORT"), 8000),
-        app_env=os.getenv("APP_ENV", "dev"),
-        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        app_name=os.getenv("APP_NAME", str(app_cfg.get("name", "Agent Sentinel"))),
+        app_host=os.getenv("APP_HOST", str(app_cfg.get("host", "0.0.0.0"))),
+        app_port=_to_int(os.getenv("APP_PORT"), int(app_cfg.get("port", 8000))),
+        app_env=os.getenv("APP_ENV", str(app_cfg.get("env", "dev"))),
+        log_level=os.getenv("LOG_LEVEL", str(app_cfg.get("log_level", "INFO"))),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_base_url=_first_non_empty(
             os.getenv("CODEX_BASE_URL"),
@@ -119,4 +132,41 @@ def get_settings() -> Settings:
         alert_api_token=os.getenv("ALERT_API_TOKEN"),
         alert_dedup_window_seconds=_to_int(os.getenv("ALERT_DEDUP_WINDOW_SECONDS"), 60),
         alert_store_limit=_to_int(os.getenv("ALERT_STORE_LIMIT"), 100),
+        aiops_workflow_config_path=os.getenv(
+            "AIOPS_WORKFLOW_CONFIG_PATH",
+            str(workflow_cfg.get("config_path", "config/workflow.yaml")),
+        ),
+        aiops_llm_models=_to_list(os.getenv("AIOPS_LLM_MODELS"))
+        or [str(item) for item in llm_cfg.get("models", [])]
+        or [_first_non_empty(os.getenv("CODEX_MODEL"), os.getenv("OPENAI_MODEL")) or "gpt-4o-mini"],
+        aiops_llm_timeout_seconds=_to_int(
+            os.getenv("AIOPS_LLM_TIMEOUT_SECONDS"),
+            int(llm_cfg.get("timeout_seconds", 15)),
+        ),
+        aiops_llm_max_retries=_to_int(
+            os.getenv("AIOPS_LLM_MAX_RETRIES"),
+            int(llm_cfg.get("max_retries", 2)),
+        ),
+        aiops_mock_llm_enabled=_to_bool(
+            os.getenv("AIOPS_MOCK_LLM_ENABLED"),
+            bool(llm_cfg.get("mock_enabled", False)),
+        ),
+        aiops_human_confirm_timeout_seconds=_to_int(
+            os.getenv("AIOPS_HUMAN_CONFIRM_TIMEOUT_SECONDS"),
+            int(workflow_cfg.get("human_confirm_timeout_seconds", 300)),
+        ),
+        aiops_human_confirm_enabled=_to_bool(
+            os.getenv("AIOPS_HUMAN_CONFIRM_ENABLED"),
+            bool(workflow_cfg.get("human_confirm_enabled", True)),
+        ),
+        redis_url=os.getenv("REDIS_URL", str(redis_cfg.get("url", "")) or None),
     )
+
+
+def _load_yaml_settings() -> dict[str, object]:
+    try:
+        from agent_sentinel.utils.config_loader import load_yaml
+
+        return load_yaml(os.getenv("AIOPS_SETTINGS_PATH", "config/settings.yaml"))
+    except Exception:
+        return {}

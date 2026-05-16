@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import argparse
 import logging
+from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 from agent_sentinel.alerts import FeishuWebhookNotifier, RealtimeAlertService
 from agent_sentinel.config import Settings, get_settings
 from agent_sentinel.feishu_app import FeishuBotClient, extract_text_from_message_content
+from agent_sentinel.feishu.card_handler import FeishuCardHandler, HumanDecisionStore
+from agent_sentinel.feishu.sender import FeishuSender
 from agent_sentinel.feishu_longconn import FeishuLongConnectionBot
 from agent_sentinel.feishu_poller import FeishuMessagePoller
+from agent_sentinel.graph.state import DiagnosisState
+from agent_sentinel.graph.workflow import DiagnosisWorkflow, build_llm_executor
 from agent_sentinel.schemas import (
     AlertAnalyzeRequest,
     AlertAnalyzeResponse,
@@ -53,6 +58,10 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     chat_service: SingleTurnChatService | None = None
     analysis_service: AlertAnalysisService | None = None
     feishu_bot_client = FeishuBotClient(settings)
+    feishu_sender = FeishuSender(feishu_bot_client)
+    decision_store = HumanDecisionStore(settings.redis_url)
+    card_handler = FeishuCardHandler(decision_store)
+    aiops_workflow: DiagnosisWorkflow | None = None
     longconn_bot: FeishuLongConnectionBot | None = None
     poller_bot: FeishuMessagePoller | None = None
 
@@ -69,6 +78,17 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         if analysis_service is None:
             analysis_service = AlertAnalysisService(settings)
         return analysis_service
+
+    def get_aiops_workflow() -> DiagnosisWorkflow:
+        nonlocal aiops_workflow
+        if aiops_workflow is None:
+            aiops_workflow = DiagnosisWorkflow(
+                settings=settings,
+                llm=build_llm_executor(settings),
+                sender=feishu_sender,
+                decision_store=decision_store,
+            )
+        return aiops_workflow
 
     def verify_alert_token(provided_token: str | None) -> None:
         expected_token = settings.alert_api_token
@@ -254,6 +274,61 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             logger.exception("Failed to analyze alert")
             report_exception("/alerts/analyze", exc)
             raise HTTPException(status_code=500, detail="Failed to analyze alert.") from exc
+
+    @app.post("/aiops/diagnose")
+    async def aiops_diagnose(
+        payload: AlertAnalyzeRequest,
+        x_alert_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        try:
+            verify_alert_token(x_alert_token)
+            initial_state: DiagnosisState = {
+                "raw_alert": {
+                    "source": payload.source,
+                    "level": payload.level,
+                    "summary": payload.summary,
+                    "details": payload.details,
+                    "raw_text": payload.raw_text,
+                    "trigger_type": payload.trigger_type,
+                    "tags": payload.tags,
+                },
+                "chat_id": payload.chat_id,
+                "thread_root_message_id": payload.thread_root_message_id or payload.message_id,
+                "mention_open_id": payload.mention_open_id,
+                "mention_name": payload.mention_name,
+                "messages": [],
+                "evidence": [],
+                "retrieved_docs": [],
+                "live_data": {},
+                "recommended_plan": {},
+                "validation_result": False,
+                "need_human": True,
+            }
+            final_state = await get_aiops_workflow().run_streaming(initial_state)
+            return {
+                "status": "ok",
+                "summary": final_state.get("alert_summary", ""),
+                "recommended_plan": final_state.get("recommended_plan", {}),
+                "evidence": final_state.get("evidence", []),
+                "validation_result": final_state.get("validation_result", False),
+                "human_decision": final_state.get("human_decision", "unknown"),
+                "final_text": final_state.get("final_text", ""),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("AIOps diagnosis failed")
+            report_exception("/aiops/diagnose", exc)
+            raise HTTPException(status_code=500, detail="AIOps diagnosis failed.") from exc
+
+    @app.post("/feishu/card/callback")
+    async def feishu_card_callback(request: Request) -> dict[str, str]:
+        try:
+            payload = await request.json()
+            return await card_handler.handle(payload)
+        except Exception as exc:
+            logger.exception("Failed to process Feishu card callback")
+            raise HTTPException(status_code=500, detail="Failed to process card callback.") from exc
 
     @app.post("/feishu/events")
     def feishu_events(payload: FeishuEventEnvelope) -> dict[str, object]:

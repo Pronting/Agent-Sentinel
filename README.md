@@ -1,166 +1,221 @@
 # Agent Sentinel
 
-一个基于 LangChain 的最小可运行告警分析服务，支持：
+Agent Sentinel 是一个基于 FastAPI + LangChain + LangGraph 的多 Agent 智能告警诊断服务。它保留原有飞书消息接入、告警上报、简单对话接口，同时新增一条 AIOps 诊断工作流：
 
-- 单轮对话接口 `POST /chat/once`
-- 飞书 webhook 告警推送
-- 告警上报接口 `POST /alerts/report`
-- 告警分析接口 `POST /alerts/analyze`
-- 飞书企业自建应用事件入口 `POST /feishu/events`
+1. 飞书或 HTTP 告警接入
+2. 告警理解与摘要
+3. Mock RAG 历史案例检索
+4. 条件路由判断是否需要实时数据
+5. 并发调用 Mock 指标、日志、拓扑工具
+6. 生成带证据链的诊断方案
+7. 规则 + 轻量 LLM 校验
+8. 飞书交互卡片人工确认
+9. 流式推送中间状态并发送最终结果
 
 ## 项目结构
 
 ```text
 .
-├─ .env.example
-├─ .gitignore
-├─ pyproject.toml
-├─ README.md
+├─ config/
+│  ├─ settings.yaml
+│  ├─ workflow.yaml
+│  ├─ .env.example
+│  └─ prompts/
+│     ├─ understand.yaml
+│     ├─ generate_plan.yaml
+│     └─ validate.yaml
+├─ src/
+│  ├─ main.py
+│  └─ agent_sentinel/
+│     ├─ agents/
+│     ├─ feishu/
+│     ├─ graph/
+│     ├─ llm/
+│     ├─ rag/
+│     ├─ tools/
+│     ├─ utils/
+│     └─ main.py
 ├─ tests/
-└─ src/
-   └─ agent_sentinel/
-      ├─ alerts.py
-      ├─ config.py
-      ├─ feishu_app.py
-      ├─ llm.py
-      ├─ main.py
-      ├─ schemas.py
-      └─ service.py
+│  ├─ test_health.py
+│  └─ test_workflow.py
+├─ Dockerfile
+├─ docker-compose.yml
+├─ pyproject.toml
+└─ requirements.txt
 ```
 
-## 安装
+## 本地运行
 
-```bash
+```powershell
+cd E:\pythonStudy\code\Agent-Sentinel
 python -m venv .venv
-.venv\Scripts\activate
+.\.venv\Scripts\activate
 pip install -e .[dev]
+copy config\.env.example .env
 ```
 
-## 环境变量
+先用 Mock LLM 跑通流程时，保持：
 
-复制 `.env.example` 为 `.env`，然后补充你自己的密钥。
+```env
+AIOPS_MOCK_LLM_ENABLED=true
+AIOPS_HUMAN_CONFIRM_ENABLED=false
+```
 
-LLM 相关：
+启动服务：
 
-- `OPENAI_API_KEY`
-- `CODEX_BASE_URL` 或 `OPENAI_BASE_URL`
-- `CODEX_MODEL` 或 `OPENAI_MODEL`
-- `OPENAI_HTTP_TRUST_ENV=false`
-
-飞书企业自建应用相关：
-
-- `FEISHU_APP_ID`
-- `FEISHU_APP_SECRET`
-- `FEISHU_EVENT_VERIFICATION_TOKEN`
-- `FEISHU_EVENT_ENCRYPT_KEY`
-- `FEISHU_BOT_NAME`
-- `FEISHU_ALLOWED_CHAT_IDS`
-- `FEISHU_ANALYZE_MENTION_ONLY=true`
-- `FEISHU_LONG_CONNECTION_ENABLED=false`
-- `FEISHU_MESSAGE_POLLING_ENABLED=true`
-- `FEISHU_MESSAGE_POLLING_INTERVAL_SECONDS=5`
-- `FEISHU_MESSAGE_POLLING_PAGE_SIZE=20`
-
-飞书 webhook 告警相关：
-
-- `FEISHU_WEBHOOK_URL`
-- `FEISHU_SECRET`
-
-分析与告警相关：
-
-- `ALERT_API_TOKEN`
-- `ALERT_ANALYSIS_ENABLED=true`
-- `ALERT_ANALYSIS_TITLE_PREFIX=Alert Analysis`
-
-说明：
-
-- 当前脚手架默认支持未加密的飞书事件回调。
-- 如果你暂时不打算处理事件加密，可先让 `FEISHU_EVENT_ENCRYPT_KEY` 留空，并在飞书后台关闭事件加密。
-- 如果你没有公网域名，可以直接启用“定时轮询拉消息”模式，不依赖回调和公网入口。
-
-## 启动
-
-```bash
+```powershell
 .\.venv\Scripts\python.exe -m agent_sentinel.main
 ```
 
 健康检查：
 
-```bash
+```powershell
 curl http://127.0.0.1:8000/health
 ```
 
-单轮对话：
+## AIOps 诊断演示
 
-```bash
-curl -X POST http://127.0.0.1:8000/chat/once ^
+```powershell
+curl -X POST http://127.0.0.1:8000/aiops/diagnose ^
   -H "Content-Type: application/json" ^
-  -d "{\"message\":\"你好，请用一句话介绍你自己\"}"
+  -H "X-Alert-Token: replace-with-a-strong-token" ^
+  -d "{\"chat_id\":\"\",\"source\":\"alert-bot\",\"level\":\"ERROR\",\"summary\":\"订单同步超时\",\"details\":\"timeout after 3 retries\",\"raw_text\":\"[ALERT] order sync timeout\",\"trigger_type\":\"bot_alert\",\"tags\":[\"prod\",\"order\"]}"
 ```
 
-## 飞书后台推荐配置
+`chat_id` 为空时不会真实发送飞书消息，但会完整执行 LangGraph 流程。接入真实飞书群时填入 `chat_id`，并配置 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`。
 
-分析 bot 使用企业自建应用：
+## Docker 运行
 
-1. 开启机器人能力
-2. 开启事件订阅
-3. 没有公网域名时，推荐开启当前项目的“消息轮询”模式
-4. 给应用加读取群消息历史和发送消息相关权限
-5. 发布应用版本并把机器人拉进群
-
-## 两条触发链
-
-### 1. 人在群里 @分析bot
-
-轮询模式下，服务启动后会定时调用 `GET /open-apis/im/v1/messages`
-按 `FEISHU_ALLOWED_CHAT_IDS` 逐个拉取群历史消息，然后筛出 `@分析bot`
-或包含机器人名称的文本消息。
-
-当前代码会：
-
-1. 拉取指定群最新消息
-2. 基于 `message_id` 去重
-3. 读取群消息文本
-4. 调 LLM 做告警分析
-5. 再把分析结果发回同一个群
-
-### 2. 告警 bot 直接调用分析接口
-
-请求示例：
-
-```bash
-curl -X POST http://127.0.0.1:8000/alerts/analyze ^
-  -H "Content-Type: application/json" ^
-  -H "X-Alert-Token: your-alert-token" ^
-  -d "{\"chat_id\":\"oc_xxx\",\"source\":\"alert-bot\",\"level\":\"ERROR\",\"summary\":\"订单同步失败\",\"details\":\"timeout after 3 retries\",\"raw_text\":\"[ALERT] order sync timeout\",\"trigger_type\":\"bot_alert\",\"tags\":[\"job\",\"prod\"]}"
+```powershell
+copy config\.env.example .env
+docker compose up --build
 ```
 
-这个接口会：
+Compose 会启动 Redis 和 app。Redis 当前用于保存人工确认决策，后续可以替换为 LangGraph checkpoint 持久化。
 
-1. 调 LLM 分析告警
-2. 用企业自建应用身份拿 `tenant_access_token`
-3. 调飞书发消息 API，把分析结果发回指定群
+## 关键配置
 
-## 其他接口
+`config/settings.yaml` 提供默认配置，`.env` 会覆盖敏感项和部署差异：
 
-测试 webhook 告警：
-
-```bash
-curl -X POST http://127.0.0.1:8000/alerts/test
+```env
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o-mini
+AIOPS_LLM_MODELS=gpt-4o-mini,gpt-3.5-turbo
+AIOPS_MOCK_LLM_ENABLED=false
+AIOPS_HUMAN_CONFIRM_ENABLED=true
+AIOPS_HUMAN_CONFIRM_TIMEOUT_SECONDS=300
+REDIS_URL=redis://localhost:6379/0
 ```
 
-上报原始告警：
+多模型降级由 `AIOPS_LLM_MODELS` 控制，按顺序尝试。`LLMExecutor` 会记录模型、耗时、prompt/response 字符数，并在主模型失败后切到备用模型。
 
-```bash
-curl -X POST http://127.0.0.1:8000/alerts/report ^
-  -H "Content-Type: application/json" ^
-  -H "X-Alert-Token: your-alert-token" ^
-  -d "{\"source\":\"nightly-job\",\"level\":\"ERROR\",\"summary\":\"Nightly sync failed\",\"details\":\"timeout after retries\"}"
+## Workflow YAML
+
+`config/workflow.yaml` 描述 LangGraph 拓扑：
+
+```yaml
+nodes:
+  - name: understand
+  - name: retrieve
+  - name: fetch_live_data
+  - name: generate_plan
+  - name: validate
+  - name: human_confirm
+  - name: final_result
+edges:
+  - from: understand
+    to: retrieve
+conditional_edges:
+  - from: retrieve
+    condition: should_fetch
+    mapping:
+      fetch: fetch_live_data
+      skip: generate_plan
 ```
 
-查看最近告警：
+代码在 `agent_sentinel.graph.workflow.DiagnosisWorkflow` 中读取该文件，动态注册节点和条件路由。新增节点时，需要在 YAML 中声明，并在 `_node_registry()` 中注册函数。
 
-```bash
-curl http://127.0.0.1:8000/alerts/recent ^
-  -H "X-Alert-Token: your-alert-token"
+## Prompt 外部化
+
+节点 Prompt 存放在 `config/prompts/`：
+
+- `understand.yaml`: 告警理解
+- `generate_plan.yaml`: 诊断方案与证据链
+- `validate.yaml`: 方案校验
+
+Prompt 使用 `{raw_alert}`、`{alert_summary}`、`{live_data}` 等变量渲染，后续可直接替换模板而无需改节点代码。
+
+## 飞书交互卡片
+
+启用人工确认：
+
+```env
+AIOPS_HUMAN_CONFIRM_ENABLED=true
+AIOPS_HUMAN_CONFIRM_TIMEOUT_SECONDS=300
 ```
+
+服务会通过 `FeishuSender.send_card()` 发送交互卡片，包含“同意”和“拒绝”按钮。飞书后台卡片回调地址配置为：
+
+```text
+POST http(s)://你的域名/feishu/card/callback
+```
+
+回调示例：
+
+```json
+{
+  "action": {
+    "value": {
+      "action": "diagnosis_confirm",
+      "decision_id": "uuid",
+      "decision": "approved"
+    }
+  }
+}
+```
+
+拒绝时可带 `feedback` 字段，工作流会把反馈写入 `messages` 并重新进入 `generate_plan`。5 分钟未确认会自动视为 `timeout`，并发送当前最终结果。
+
+## RAG 和工具替换
+
+RAG 现在是空实现：
+
+```python
+class MockRetriever:
+    async def retrieve(self, query: str) -> list[str]:
+        return []
+```
+
+后续替换 `agent_sentinel.rag.mock_retriever.MockRetriever` 即可接入向量库、ES 或混合检索。
+
+实时工具现在全部返回 Mock 数据，入口是 `agent_sentinel.tools.mock_tools.fetch_all_live_data()`。内部使用 `asyncio.gather` 并发调用：
+
+- `get_metrics`
+- `query_logs`
+- `get_topology`
+
+每个工具都有 `asyncio.timeout(5)` 和 tenacity 重试。
+
+## 旧接口兼容
+
+这些接口仍然保留：
+
+- `POST /chat/once`
+- `POST /alerts/report`
+- `GET /alerts/recent`
+- `POST /alerts/analyze`
+- `POST /feishu/events`
+
+新增接口：
+
+- `POST /aiops/diagnose`: 运行 LangGraph 多 Agent 诊断
+- `POST /feishu/card/callback`: 飞书交互卡片回调
+
+## 测试
+
+```powershell
+.\.venv\Scripts\pytest.exe
+```
+
+`tests/test_workflow.py` 使用 Mock LLM 和禁用人工确认，确保 LangGraph 能编译并执行完整示例流程。

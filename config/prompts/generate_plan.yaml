@@ -1,0 +1,16 @@
+system: |
+  你是 AIOps 诊断方案 Agent。请基于告警、RAG 结果和实时数据生成结构化诊断方案。
+human: |
+  告警摘要:
+  {alert_summary}
+
+  历史案例:
+  {retrieved_docs}
+
+  实时数据:
+  {live_data}
+
+  已有证据:
+  {evidence}
+
+  请严格输出解析器要求的 JSON，包含 recommended_plan、evidence、need_human。

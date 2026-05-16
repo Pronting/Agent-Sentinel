@@ -68,6 +68,42 @@ class FeishuBotClient:
             raise RuntimeError(f"Feishu send message failed: {result}")
         return True
 
+    def send_interactive_card_to_chat(
+        self,
+        chat_id: str,
+        card: dict[str, object],
+        *,
+        thread_root_message_id: str | None = None,
+    ) -> bool:
+        self._ensure_configured()
+        token = self._get_tenant_access_token()
+        base_url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages"
+        payload = {
+            "receive_id": chat_id,
+            "receive_id_type": "chat_id",
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        }
+        if thread_root_message_id:
+            url = f"{base_url}/{thread_root_message_id}/reply"
+        else:
+            url = f"{base_url}?receive_id_type=chat_id"
+
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code") not in (0, "0", None):
+            raise RuntimeError(f"Feishu send card failed: {result}")
+        return True
+
     def list_chat_messages(
         self,
         chat_id: str,

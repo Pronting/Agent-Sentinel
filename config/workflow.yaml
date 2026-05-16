@@ -1,0 +1,40 @@
+nodes:
+  - name: understand
+  - name: retrieve
+  - name: fetch_live_data
+  - name: generate_plan
+  - name: validate
+  - name: human_confirm
+  - name: final_result
+edges:
+  - from: understand
+    to: retrieve
+conditional_edges:
+  - from: retrieve
+    condition: should_fetch
+    mapping:
+      fetch: fetch_live_data
+      skip: generate_plan
+  - from: validate
+    condition: validation_result
+    mapping:
+      pass: human_confirm
+      fail: generate_plan
+  - from: human_confirm
+    condition: human_decision
+    mapping:
+      approved: final_result
+      rejected: generate_plan
+      timeout: final_result
+  - from: fetch_live_data
+    condition: always
+    mapping:
+      next: generate_plan
+  - from: generate_plan
+    condition: always
+    mapping:
+      next: validate
+  - from: final_result
+    condition: end
+    mapping:
+      end: END
