@@ -1,5 +1,44 @@
 # Agent Sentinel
 
+## 飞书 LangGraph 交互式话题流程
+
+服务支持“群内 @ 机器人 -> 原消息下创建话题 -> LangGraph 节点逐步确认”的交互模式。开启后，用户在飞书群 @ 机器人，机器人会在原消息 Thread 中执行示例流程：
+
+```text
+cache_check -> rag_retrieve -> tool_call -> summary
+```
+
+每个节点会先发送“正在执行 XX 节点...”，节点完成后发送一张 Yes/No 确认卡片：
+
+- `Yes 下一步`：确认当前节点结果，进入下一个节点。
+- `No 重试节点`：拒绝当前节点结果，重新执行当前节点。
+- 5 秒未操作：自动视为 Yes，并在话题中发送“超时未操作，自动继续”。
+
+关键配置：
+
+```env
+FEISHU_APP_ID=your-feishu-app-id
+FEISHU_APP_SECRET=your-feishu-app-secret
+FEISHU_LONG_CONNECTION_ENABLED=true
+FEISHU_MESSAGE_POLLING_ENABLED=false
+FEISHU_ANALYZE_MENTION_ONLY=true
+FEISHU_ALLOWED_CHAT_IDS=oc_xxx
+INTERACTIVE_TOPIC_ENABLED=true
+INTERACTIVE_TOPIC_WAIT_SECONDS=5
+```
+
+飞书开放平台需要启用机器人能力、消息接收事件 `im.message.receive_v1`、卡片回调事件 `card.action.triggered`，并把机器人加入目标群。长连接模式不需要公网事件回调地址；如果你使用 HTTP 卡片回调，也可以配置：
+
+```text
+https://你的公网域名/webhook/card
+```
+
+启动：
+
+```bash
+python -m agent_sentinel.main
+```
+
 Agent Sentinel 是一个基于 FastAPI + LangChain + LangGraph 的多 Agent 智能告警诊断服务。它保留原有飞书消息接入、告警上报、简单对话接口，同时新增一条 AIOps 诊断工作流：
 
 1. 飞书或 HTTP 告警接入
@@ -179,7 +218,7 @@ POST http(s)://你的域名/feishu/card/callback
 
 ## RAG 和工具替换
 
-RAG 现在是空实现：
+RAG 默认仍是 Mock 空实现：
 
 ```python
 class MockRetriever:
@@ -187,7 +226,74 @@ class MockRetriever:
         return []
 ```
 
-后续替换 `agent_sentinel.rag.mock_retriever.MockRetriever` 即可接入向量库、ES 或混合检索。
+现在已经预留 Milvus + MMR 的双 RAG 链路：
+
+- 固定文本 RAG：`aiops_static_docs`，适合 SOP、Runbook、FAQ、架构说明。
+- 历史消息 RAG：`aiops_message_history`，适合飞书群消息、历史告警、诊断结果和变更上下文。
+- 合并策略：两个 retriever 并发召回，按权重合并，再做 MMR 去冗余。
+
+启用 Milvus：
+
+```env
+RAG_PROVIDER=milvus
+MILVUS_URI=http://localhost:19530
+EMBEDDING_API_KEY=your-embedding-api-key
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL=text-embedding-3-small
+```
+
+本地只想验证链路但不调真实 embedding 时：
+
+```env
+RAG_PROVIDER=milvus
+MILVUS_URI=http://localhost:19530
+EMBEDDING_MOCK_ENABLED=true
+```
+
+关键参数：
+
+```env
+RAG_FINAL_TOP_K=6
+RAG_MMR_LAMBDA=0.55
+RAG_STATIC_COLLECTION=aiops_static_docs
+RAG_STATIC_TOP_K=8
+RAG_STATIC_WEIGHT=0.55
+RAG_MESSAGE_COLLECTION=aiops_message_history
+RAG_MESSAGE_TOP_K=12
+RAG_MESSAGE_WEIGHT=0.45
+RAG_MESSAGE_DEFAULT_DAYS=30
+```
+
+Milvus 不可用或 `MILVUS_URI` 未配置时，系统会自动降级到 Mock RAG，不中断诊断工作流。
+
+固定文本上传流程：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\init_milvus_collections.py --static-only
+.\.venv\Scripts\python.exe scripts\ingest_static_docs.py --path data\static_docs
+```
+
+固定文本默认放在：
+
+```text
+data/static_docs/
+```
+
+支持 Markdown 和 JSONL。Markdown 可以使用 frontmatter 描述元数据：
+
+```markdown
+---
+id: runbook-order-sync-timeout
+title: 订单同步超时排查 SOP
+doc_type: runbook
+service: order-sync
+tags:
+  - timeout
+---
+
+# 订单同步超时排查 SOP
+正文内容...
+```
 
 实时工具现在全部返回 Mock 数据，入口是 `agent_sentinel.tools.mock_tools.fetch_all_live_data()`。内部使用 `asyncio.gather` 并发调用：
 

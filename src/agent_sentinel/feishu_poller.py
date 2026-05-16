@@ -70,6 +70,7 @@ class FeishuMessagePoller:
             chat_id,
             page_size=max(self.settings.feishu_message_polling_page_size, 1),
         )
+        logger.debug("Polled Feishu messages chat_id=%s count=%s", chat_id, len(items))
         for message in reversed(items):
             self._handle_message(chat_id, message)
 
@@ -96,8 +97,19 @@ class FeishuMessagePoller:
 
         mentions = message.get("mentions") or []
         if self.settings.feishu_analyze_mention_only and not self._looks_like_bot_mention(content_text, mentions):
+            logger.debug(
+                "Feishu polled message skipped because it does not mention bot message_id=%s content=%s",
+                message_id,
+                content_text[:120],
+            )
             return
 
+        logger.info(
+            "Feishu polled message routed to LangGraph message_id=%s chat_id=%s content=%s",
+            message_id,
+            chat_id,
+            content_text[:120],
+        )
         self.analyze_callback(
             chat_id,
             "feishu-user",
@@ -127,7 +139,15 @@ class FeishuMessagePoller:
                     continue
                 if str(mention.get("name") or "").strip() == bot_name:
                     return True
-        return "<at " in content_text or (bot_name and bot_name in content_text)
+            if mentions:
+                return True
+        stripped = content_text.strip()
+        return (
+            "<at " in content_text
+            or stripped.startswith("@_user_")
+            or stripped.startswith("@")
+            or (bot_name and bot_name in content_text)
+        )
 
     def _extract_sender_open_id(self, sender: object) -> str | None:
         if not isinstance(sender, dict):

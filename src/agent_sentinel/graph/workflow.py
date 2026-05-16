@@ -21,7 +21,8 @@ from agent_sentinel.feishu.card_handler import HumanDecisionStore
 from agent_sentinel.feishu.sender import FeishuSender
 from agent_sentinel.graph.state import DiagnosisState
 from agent_sentinel.llm.executor import LLMExecutor
-from agent_sentinel.rag.mock_retriever import MockRetriever
+from agent_sentinel.rag.base import BaseRetriever
+from agent_sentinel.rag.factory import build_retriever
 from agent_sentinel.utils.config_loader import load_yaml
 
 logger = logging.getLogger(__name__)
@@ -37,14 +38,14 @@ class DiagnosisWorkflow:
         llm: LLMExecutor,
         sender: FeishuSender,
         decision_store: HumanDecisionStore,
-        retriever: MockRetriever | None = None,
+        retriever: BaseRetriever | None = None,
         checkpointer: Any | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm
         self.sender = sender
         self.decision_store = decision_store
-        self.retriever = retriever or MockRetriever()
+        self.retriever = retriever or build_retriever(settings)
         self.checkpointer = checkpointer or InMemorySaver()
         self._compiled: Any | None = None
 

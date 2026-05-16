@@ -130,9 +130,20 @@ class FeishuLongConnectionBot:
             import lark_oapi as lark
 
             payload = json.loads(lark.JSON.marshal(data))
-            asyncio.run(self._dispatch_card_action(payload))
+            threading.Thread(
+                target=self._run_card_action_payload,
+                args=(payload,),
+                name="feishu-card-action-dispatch",
+                daemon=True,
+            ).start()
         except Exception:
             logger.exception("Failed to process Feishu long connection card action event")
+
+    def _run_card_action_payload(self, payload: dict[str, object]) -> None:
+        try:
+            asyncio.run(self._dispatch_card_action(payload))
+        except Exception:
+            logger.exception("Failed to dispatch Feishu long connection card action event")
 
     async def _dispatch_card_action(self, payload: dict[str, object]) -> None:
         if self.card_action_callback is None:

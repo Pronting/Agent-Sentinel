@@ -740,9 +740,144 @@ Compose 包含：
 - 飞书线程回复兼容
 - 新 LangGraph Mock 工作流可编译并执行
 
-## 16. 后续替换建议
+## 16. 双 RAG 设计
 
-### 16.1 替换真实 RAG
+本项目现在预留了两条 RAG 通道：
+
+```text
+当前告警摘要
+    |
+    +--> 固定文本 RAG: SOP / Runbook / FAQ / 架构说明
+    |
+    +--> 历史消息 RAG: 飞书消息 / 历史告警 / 诊断结果 / 变更上下文
+    |
+    v
+合并 + 加权 + MMR 去冗余
+    |
+    v
+generate_plan
+```
+
+### 16.1 固定文本 RAG
+
+默认 collection：
+
+```text
+aiops_static_docs
+```
+
+建议字段：
+
+```text
+id
+text
+embedding
+doc_type
+title
+service
+component
+tags
+version
+updated_at
+source_uri
+metadata
+```
+
+用途：
+
+- 标准排障步骤
+- 服务说明
+- 故障预案
+- FAQ
+- 架构文档
+
+### 16.2 历史消息 RAG
+
+默认 collection：
+
+```text
+aiops_message_history
+```
+
+建议字段：
+
+```text
+id
+text
+embedding
+message_id
+chat_id
+sender_id
+sender_name
+message_type
+service
+level
+tags
+created_at
+thread_root_id
+source
+metadata
+```
+
+用途：
+
+- 当前群最近讨论
+- 类似告警上下文
+- 历史诊断结果
+- 近期发布和变更信息
+
+### 16.3 配置
+
+敏感信息全部放在 `.env`：
+
+```env
+RAG_PROVIDER=milvus
+MILVUS_URI=http://localhost:19530
+MILVUS_TOKEN=
+MILVUS_USER=
+MILVUS_PASSWORD=
+MILVUS_DB_NAME=
+
+EMBEDDING_API_KEY=
+EMBEDDING_BASE_URL=
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSION=1536
+EMBEDDING_MOCK_ENABLED=false
+```
+
+非敏感默认值在 `config/settings.yaml`：
+
+```yaml
+rag:
+  provider: mock
+  final_top_k: 6
+  mmr_lambda: 0.55
+  static_docs:
+    collection: aiops_static_docs
+    top_k: 8
+    weight: 0.55
+  message_history:
+    collection: aiops_message_history
+    top_k: 12
+    weight: 0.45
+    default_days: 30
+```
+
+### 16.4 代码入口
+
+| 文件 | 说明 |
+| --- | --- |
+| `src/agent_sentinel/rag/factory.py` | 根据配置创建 Mock 或 Milvus Hybrid RAG |
+| `src/agent_sentinel/rag/static_doc_retriever.py` | 固定文本检索 |
+| `src/agent_sentinel/rag/message_history_retriever.py` | 历史消息检索 |
+| `src/agent_sentinel/rag/hybrid_retriever.py` | 并发召回、合并、去重、MMR |
+| `src/agent_sentinel/rag/mmr.py` | MMR 算法 |
+| `src/agent_sentinel/rag/embedding.py` | Embedding 调用和 Mock embedding |
+| `src/agent_sentinel/rag/milvus_client.py` | Milvus search 封装 |
+
+## 17. 后续替换建议
+
+### 17.1 替换真实 RAG
 
 替换位置：
 
@@ -766,7 +901,7 @@ async def retrieve(self, query: str) -> list[str]:
 - pgvector
 - 企业知识库 API
 
-### 16.2 替换真实工具
+### 17.2 替换真实工具
 
 替换位置：
 
@@ -782,7 +917,7 @@ src/agent_sentinel/tools/mock_tools.py
 
 保留 `asyncio.gather` 并发执行，避免诊断链路被单个工具拖慢。
 
-### 16.3 增强工作流持久化
+### 17.3 增强工作流持久化
 
 当前人工确认使用 Redis 保存决策结果。后续如果需要完整恢复中断工作流，可以接入 LangGraph checkpointer。
 
@@ -793,7 +928,7 @@ src/agent_sentinel/tools/mock_tools.py
 - LangGraph thread_id
 - 飞书 message_id 与 workflow run_id 绑定
 
-### 16.4 增强卡片交互
+### 17.4 增强卡片交互
 
 后续可扩展按钮：
 
@@ -803,15 +938,16 @@ src/agent_sentinel/tools/mock_tools.py
 - 补充上下文
 - 转人工值班
 
-## 17. 风险与注意事项
+## 18. 风险与注意事项
 
-- 当前 RAG 是空实现，不会返回历史案例。
+- 默认 RAG 是 Mock 空实现；设置 `RAG_PROVIDER=milvus` 后才会访问 Milvus。
+- Milvus 不可用或未配置 `MILVUS_URI` 时，系统会降级为空检索结果。
 - 当前工具全部是 Mock 数据，不会访问真实监控系统。
 - `AIOPS_HUMAN_CONFIRM_ENABLED=true` 且飞书未配置时，节点会跳过真实发送，但仍可能等待确认；本地演示建议关闭人工确认。
 - 飞书加密事件当前仍沿用原项目限制，未实现事件解密。
 - FastAPI `on_event` 目前有弃用警告，功能不受影响，后续可迁移到 lifespan。
 
-## 18. 文件索引
+## 19. 文件索引
 
 | 文件 | 说明 |
 | --- | --- |
@@ -827,4 +963,3 @@ src/agent_sentinel/tools/mock_tools.py
 | `config/workflow.yaml` | 工作流拓扑 |
 | `config/prompts/*.yaml` | 节点 Prompt 模板 |
 | `tests/test_workflow.py` | LangGraph 工作流测试 |
-

@@ -26,3 +26,24 @@ tools:
 
 redis:
   url: redis://redis:6379/0
+
+rag:
+  provider: mock
+  final_top_k: 6
+  mmr_lambda: 0.55
+  static_docs:
+    enabled: true
+    collection: aiops_static_docs
+    top_k: 8
+    weight: 0.55
+  message_history:
+    enabled: true
+    collection: aiops_message_history
+    top_k: 12
+    weight: 0.45
+    default_days: 30
+
+embedding:
+  model: text-embedding-3-small
+  dimension: 1536
+  mock_enabled: false

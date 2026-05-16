@@ -78,6 +78,30 @@ class Settings:
     aiops_human_confirm_timeout_seconds: int = 300
     aiops_human_confirm_enabled: bool = True
     redis_url: str | None = None
+    rag_provider: str = "mock"
+    rag_final_top_k: int = 6
+    rag_mmr_lambda: float = 0.55
+    rag_static_enabled: bool = True
+    rag_static_collection: str = "aiops_static_docs"
+    rag_static_top_k: int = 8
+    rag_static_weight: float = 0.55
+    rag_message_enabled: bool = True
+    rag_message_collection: str = "aiops_message_history"
+    rag_message_top_k: int = 12
+    rag_message_weight: float = 0.45
+    rag_message_default_days: int = 30
+    milvus_uri: str | None = None
+    milvus_token: str | None = None
+    milvus_user: str | None = None
+    milvus_password: str | None = None
+    milvus_db_name: str | None = None
+    embedding_api_key: str | None = None
+    embedding_base_url: str | None = None
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimension: int = 1536
+    embedding_mock_enabled: bool = False
+    interactive_topic_enabled: bool = True
+    interactive_topic_wait_seconds: int = 5
 
 
 def get_settings() -> Settings:
@@ -87,6 +111,14 @@ def get_settings() -> Settings:
     llm_cfg = yaml_settings.get("llm", {})
     workflow_cfg = yaml_settings.get("workflow", {})
     redis_cfg = yaml_settings.get("redis", {})
+    rag_cfg = yaml_settings.get("rag", {})
+    static_cfg = dict(rag_cfg.get("static_docs", {})) if isinstance(rag_cfg.get("static_docs", {}), dict) else {}
+    message_cfg = (
+        dict(rag_cfg.get("message_history", {}))
+        if isinstance(rag_cfg.get("message_history", {}), dict)
+        else {}
+    )
+    embedding_cfg = yaml_settings.get("embedding", {})
     return Settings(
         app_name=os.getenv("APP_NAME", str(app_cfg.get("name", "Agent Sentinel"))),
         app_host=os.getenv("APP_HOST", str(app_cfg.get("host", "0.0.0.0"))),
@@ -162,6 +194,54 @@ def get_settings() -> Settings:
             bool(workflow_cfg.get("human_confirm_enabled", True)),
         ),
         redis_url=os.getenv("REDIS_URL", str(redis_cfg.get("url", "")) or None),
+        rag_provider=os.getenv("RAG_PROVIDER", str(rag_cfg.get("provider", "mock"))),
+        rag_final_top_k=_to_int(os.getenv("RAG_FINAL_TOP_K"), int(rag_cfg.get("final_top_k", 6))),
+        rag_mmr_lambda=_to_float(os.getenv("RAG_MMR_LAMBDA"), float(rag_cfg.get("mmr_lambda", 0.55))),
+        rag_static_enabled=_to_bool(
+            os.getenv("RAG_STATIC_ENABLED"),
+            bool(static_cfg.get("enabled", True)),
+        ),
+        rag_static_collection=os.getenv(
+            "RAG_STATIC_COLLECTION",
+            str(static_cfg.get("collection", "aiops_static_docs")),
+        ),
+        rag_static_top_k=_to_int(os.getenv("RAG_STATIC_TOP_K"), int(static_cfg.get("top_k", 8))),
+        rag_static_weight=_to_float(os.getenv("RAG_STATIC_WEIGHT"), float(static_cfg.get("weight", 0.55))),
+        rag_message_enabled=_to_bool(
+            os.getenv("RAG_MESSAGE_ENABLED"),
+            bool(message_cfg.get("enabled", True)),
+        ),
+        rag_message_collection=os.getenv(
+            "RAG_MESSAGE_COLLECTION",
+            str(message_cfg.get("collection", "aiops_message_history")),
+        ),
+        rag_message_top_k=_to_int(os.getenv("RAG_MESSAGE_TOP_K"), int(message_cfg.get("top_k", 12))),
+        rag_message_weight=_to_float(os.getenv("RAG_MESSAGE_WEIGHT"), float(message_cfg.get("weight", 0.45))),
+        rag_message_default_days=_to_int(
+            os.getenv("RAG_MESSAGE_DEFAULT_DAYS"),
+            int(message_cfg.get("default_days", 30)),
+        ),
+        milvus_uri=os.getenv("MILVUS_URI"),
+        milvus_token=os.getenv("MILVUS_TOKEN"),
+        milvus_user=os.getenv("MILVUS_USER"),
+        milvus_password=os.getenv("MILVUS_PASSWORD"),
+        milvus_db_name=os.getenv("MILVUS_DB_NAME"),
+        embedding_api_key=_first_non_empty(os.getenv("EMBEDDING_API_KEY"), os.getenv("OPENAI_API_KEY")),
+        embedding_base_url=_first_non_empty(os.getenv("EMBEDDING_BASE_URL"), os.getenv("OPENAI_BASE_URL")),
+        embedding_model=os.getenv(
+            "EMBEDDING_MODEL",
+            str(embedding_cfg.get("model", "text-embedding-3-small")),
+        ),
+        embedding_dimension=_to_int(
+            os.getenv("EMBEDDING_DIMENSION"),
+            int(embedding_cfg.get("dimension", 1536)),
+        ),
+        embedding_mock_enabled=_to_bool(
+            os.getenv("EMBEDDING_MOCK_ENABLED"),
+            bool(embedding_cfg.get("mock_enabled", False)),
+        ),
+        interactive_topic_enabled=_to_bool(os.getenv("INTERACTIVE_TOPIC_ENABLED"), True),
+        interactive_topic_wait_seconds=_to_int(os.getenv("INTERACTIVE_TOPIC_WAIT_SECONDS"), 5),
     )
 
 

@@ -18,6 +18,8 @@ from agent_sentinel.feishu_longconn import FeishuLongConnectionBot
 from agent_sentinel.feishu_poller import FeishuMessagePoller
 from agent_sentinel.graph.state import DiagnosisState
 from agent_sentinel.graph.workflow import DiagnosisWorkflow, build_llm_executor
+from agent_sentinel.interactive_topic import InteractiveTopicWorkflow
+from agent_sentinel.interactive_topic.topic_sender import InteractiveTopicSender
 from agent_sentinel.schemas import (
     AlertAnalyzeRequest,
     AlertAnalyzeResponse,
@@ -29,7 +31,7 @@ from agent_sentinel.schemas import (
     FeishuEventEnvelope,
     HealthResponse,
 )
-from agent_sentinel.service import AlertAnalysisService, SingleTurnChatService
+from agent_sentinel.service import SingleTurnChatService
 
 
 def configure_logging(log_level: str) -> None:
@@ -58,12 +60,12 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     )
 
     chat_service: SingleTurnChatService | None = None
-    analysis_service: AlertAnalysisService | None = None
     feishu_bot_client = FeishuBotClient(settings)
     feishu_sender = FeishuSender(feishu_bot_client)
     decision_store = HumanDecisionStore(settings.redis_url)
     card_handler = FeishuCardHandler(decision_store)
     aiops_workflow: DiagnosisWorkflow | None = None
+    interactive_topic_workflow: InteractiveTopicWorkflow | None = None
     longconn_bot: FeishuLongConnectionBot | None = None
     poller_bot: FeishuMessagePoller | None = None
 
@@ -75,12 +77,6 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             chat_service = SingleTurnChatService(settings)
         return chat_service
 
-    def get_analysis_service() -> AlertAnalysisService:
-        nonlocal analysis_service
-        if analysis_service is None:
-            analysis_service = AlertAnalysisService(settings)
-        return analysis_service
-
     def get_aiops_workflow() -> DiagnosisWorkflow:
         nonlocal aiops_workflow
         if aiops_workflow is None:
@@ -91,6 +87,18 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                 decision_store=decision_store,
             )
         return aiops_workflow
+
+    def get_interactive_topic_workflow() -> InteractiveTopicWorkflow:
+        nonlocal interactive_topic_workflow
+        if interactive_topic_workflow is None:
+            interactive_topic_workflow = InteractiveTopicWorkflow(
+                sender=InteractiveTopicSender(
+                    feishu_bot_client,
+                    wait_seconds=settings.interactive_topic_wait_seconds,
+                ),
+                wait_seconds=settings.interactive_topic_wait_seconds,
+            )
+        return interactive_topic_workflow
 
     def verify_alert_token(provided_token: str | None) -> None:
         expected_token = settings.alert_api_token
@@ -217,6 +225,11 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         return final_text, sent
 
     async def resume_workflow_from_callback(payload: dict[str, Any], transport: str) -> dict[str, str]:
+        if settings.interactive_topic_enabled:
+            interactive_result = await get_interactive_topic_workflow().handle_card_callback(payload, source=transport)
+            if interactive_result.get("status") != "ignored":
+                return interactive_result
+
         context = await card_handler.parse_callback(payload)
         if context is None:
             return {"status": "ignored"}
@@ -257,6 +270,16 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         mention_open_id: str | None = None,
         mention_name: str | None = None,
     ) -> tuple[str, bool]:
+        if settings.interactive_topic_enabled:
+            root_message_id = thread_root_message_id
+            if not root_message_id:
+                logger.warning("Interactive topic skipped because root message id is missing chat_id=%s", chat_id)
+                return "Interactive topic skipped: root message id is missing.", False
+            return get_interactive_topic_workflow().start_sync(
+                chat_id,
+                root_message_id,
+                raw_text or details or summary,
+            )
         return asyncio.run(
             run_workflow_and_send(
                 chat_id=chat_id,
@@ -457,6 +480,15 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             logger.exception("Failed to process Feishu card callback")
             raise HTTPException(status_code=500, detail="Failed to process card callback.") from exc
 
+    @app.post("/webhook/card")
+    async def webhook_card_callback(request: Request) -> dict[str, str]:
+        try:
+            payload = await request.json()
+            return await resume_workflow_from_callback(payload, transport="http")
+        except Exception as exc:
+            logger.exception("Failed to process webhook card callback")
+            raise HTTPException(status_code=500, detail="Failed to process card callback.") from exc
+
     @app.post("/feishu/events")
     async def feishu_events(payload: FeishuEventEnvelope) -> dict[str, object]:
         try:
@@ -513,6 +545,12 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                 or str(message.get("message_id") or "").strip()
                 or None
             )
+            if settings.interactive_topic_enabled:
+                if not thread_root_message_id:
+                    return {"status": "ignored", "reason": "missing root message id"}
+                task_id = await get_interactive_topic_workflow().start(chat_id, thread_root_message_id, content_text)
+                return {"status": "ok", "sent_to_feishu": True, "task_id": task_id}
+
             analysis, sent = await run_workflow_and_send(
                 chat_id=chat_id,
                 source="feishu-user",

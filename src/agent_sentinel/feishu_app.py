@@ -41,18 +41,20 @@ class FeishuBotClient:
             display_name = mention_name or "user"
             final_text = f'<at user_id="{mention_open_id}">@{display_name}</at> {text}'
 
-        payload = {
-            "receive_id": chat_id,
-            "receive_id_type": "chat_id",
-            "msg_type": "text",
-            "content": json.dumps({"text": final_text}, ensure_ascii=False),
-        }
-
         if thread_root_message_id:
             url = f"{base_url}/{thread_root_message_id}/reply"
-            payload["reply_in_thread"] = True
+            payload = {
+                "msg_type": "text",
+                "content": json.dumps({"text": final_text}, ensure_ascii=False),
+                "reply_in_thread": True,
+            }
         else:
             url = f"{base_url}?receive_id_type=chat_id"
+            payload = {
+                "receive_id": chat_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": final_text}, ensure_ascii=False),
+            }
 
         response = requests.post(
             url,
@@ -79,17 +81,20 @@ class FeishuBotClient:
         self._ensure_configured()
         token = self._get_tenant_access_token()
         base_url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages"
-        payload = {
-            "receive_id": chat_id,
-            "receive_id_type": "chat_id",
-            "msg_type": "interactive",
-            "content": json.dumps(card, ensure_ascii=False),
-        }
         if thread_root_message_id:
             url = f"{base_url}/{thread_root_message_id}/reply"
-            payload["reply_in_thread"] = True
+            payload = {
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+                "reply_in_thread": True,
+            }
         else:
             url = f"{base_url}?receive_id_type=chat_id"
+            payload = {
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            }
 
         response = requests.post(
             url,
@@ -104,6 +109,79 @@ class FeishuBotClient:
         result = response.json()
         if result.get("code") not in (0, "0", None):
             raise RuntimeError(f"Feishu send card failed: {result}")
+        return True
+
+    def send_topic_text(self, chat_id: str, root_message_id: str, text: str) -> str | None:
+        """Reply in the source message thread and return the new Feishu message_id."""
+        self._ensure_configured()
+        token = self._get_tenant_access_token()
+        url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages/{root_message_id}/reply"
+        payload = {
+            "msg_type": "text",
+            "content": json.dumps({"text": text}, ensure_ascii=False),
+            "reply_in_thread": True,
+        }
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code") not in (0, "0", None):
+            raise RuntimeError(f"Feishu send topic text failed: {result}")
+        data = result.get("data") or {}
+        return data.get("message_id") if isinstance(data, dict) else None
+
+    def send_topic_card(self, chat_id: str, root_message_id: str, card: dict[str, object]) -> str | None:
+        """Send an interactive card in the source message thread and return message_id."""
+        self._ensure_configured()
+        token = self._get_tenant_access_token()
+        url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages/{root_message_id}/reply"
+        payload = {
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+            "reply_in_thread": True,
+        }
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code") not in (0, "0", None):
+            raise RuntimeError(f"Feishu send topic card failed: {result}")
+        data = result.get("data") or {}
+        return data.get("message_id") if isinstance(data, dict) else None
+
+    def update_message_card(self, message_id: str, card: dict[str, object]) -> bool:
+        """Best-effort update for a bot-sent interactive card."""
+        self._ensure_configured()
+        token = self._get_tenant_access_token()
+        url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages/{message_id}"
+        payload = {"content": json.dumps(card, ensure_ascii=False)}
+        response = requests.patch(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=payload,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code") not in (0, "0", None):
+            raise RuntimeError(f"Feishu update message card failed: {result}")
         return True
 
     def list_chat_messages(

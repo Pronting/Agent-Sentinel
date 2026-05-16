@@ -40,6 +40,8 @@ def make_settings() -> Settings:
         alert_api_token="test-token",
         alert_dedup_window_seconds=60,
         alert_store_limit=100,
+        interactive_topic_enabled=False,
+        interactive_topic_wait_seconds=5,
     )
 
 
@@ -202,6 +204,67 @@ def test_feishu_event_routes_into_langgraph_workflow() -> None:
         assert state["raw_alert"]["trigger_type"] == "user_message"
 
 
+def test_feishu_event_starts_interactive_topic_workflow() -> None:
+    settings = make_settings()
+    settings.interactive_topic_enabled = True
+    settings.feishu_allowed_chat_ids = ["oc_test_chat"]
+    with patch("agent_sentinel.main.InteractiveTopicWorkflow") as workflow_cls:
+        workflow_cls.return_value.start = AsyncMock(return_value="topic-task-1")
+
+        app = build_app(settings)
+        client = TestClient(app)
+
+        response = client.post(
+            "/feishu/events",
+            json={
+                "schema": "2.0",
+                "header": {
+                    "event_type": "im.message.receive_v1",
+                    "token": "verify-token",
+                },
+                "event": {
+                    "sender": {
+                        "sender_type": "user",
+                        "sender_id": "ou_user",
+                        "name": "Fe",
+                    },
+                    "message": {
+                        "chat_id": "oc_test_chat",
+                        "message_id": "om_original_message",
+                        "root_id": "om_thread_root",
+                        "mentions": [{"name": "Analysis Bot"}],
+                        "content": '{"text":"@bot run interactive flow"}',
+                    },
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok", "sent_to_feishu": True, "task_id": "topic-task-1"}
+        workflow_cls.return_value.start.assert_awaited_once_with(
+            "oc_test_chat",
+            "om_thread_root",
+            "@bot run interactive flow",
+        )
+
+
+def test_webhook_card_routes_interactive_topic_callback() -> None:
+    settings = make_settings()
+    settings.interactive_topic_enabled = True
+    with patch("agent_sentinel.main.InteractiveTopicWorkflow") as workflow_cls:
+        workflow_cls.return_value.handle_card_callback = AsyncMock(return_value={"status": "ok"})
+
+        app = build_app(settings)
+        client = TestClient(app)
+
+        payload = {"action": {"value": {"task_id": "topic-1", "node_name": "cache_check", "action": "next"}}}
+        response = client.post("/webhook/card", json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        workflow_cls.return_value.handle_card_callback.assert_awaited_once_with(payload, source="http")
+
+
 def test_feishu_card_callback_resumes_workflow() -> None:
     settings = make_settings()
     with (
@@ -318,7 +381,7 @@ def test_feishu_bot_client_uses_reply_endpoint_for_thread_reply() -> None:
     assert post_mock.call_count == 2
     send_args, send_kwargs = post_mock.call_args_list[1]
     assert send_args[0].endswith("/open-apis/im/v1/messages/om_thread_root/reply")
-    assert send_kwargs["json"]["receive_id"] == "oc_test_chat"
+    assert "receive_id" not in send_kwargs["json"]
     assert send_kwargs["json"]["reply_in_thread"] is True
 
 
@@ -350,6 +413,7 @@ def test_feishu_bot_client_uses_thread_reply_for_interactive_cards() -> None:
     send_args, send_kwargs = post_mock.call_args_list[1]
     assert send_args[0].endswith("/open-apis/im/v1/messages/om_thread_root/reply")
     assert send_kwargs["json"]["msg_type"] == "interactive"
+    assert "receive_id" not in send_kwargs["json"]
     assert send_kwargs["json"]["reply_in_thread"] is True
 
 
