@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -19,9 +20,15 @@ AnalyzeCallback = Callable[
 
 
 class FeishuLongConnectionBot:
-    def __init__(self, settings: Settings, analyze_callback: AnalyzeCallback) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        analyze_callback: AnalyzeCallback,
+        card_action_callback: Callable[[dict[str, object]], dict[str, str]] | None = None,
+    ) -> None:
         self.settings = settings
         self.analyze_callback = analyze_callback
+        self.card_action_callback = card_action_callback
         self._thread: threading.Thread | None = None
         self._started = False
 
@@ -52,14 +59,16 @@ class FeishuLongConnectionBot:
     def _run_forever(self) -> None:
         import lark_oapi as lark
 
-        event_handler = (
+        builder = (
             lark.EventDispatcherHandler.builder(
                 self.settings.feishu_event_encrypt_key or "",
                 self.settings.feishu_event_verification_token or "",
             )
             .register_p2_im_message_receive_v1(self._handle_message_event)
-            .build()
         )
+        if self.card_action_callback is not None:
+            builder = builder.register_p2_card_action_trigger(self._handle_card_action_event)
+        event_handler = builder.build()
 
         ws_client = lark.ws.Client(
             app_id=self.settings.feishu_app_id,
@@ -113,6 +122,24 @@ class FeishuLongConnectionBot:
             )
         except Exception:
             logger.exception("Failed to process Feishu long connection message event")
+
+    def _handle_card_action_event(self, data: object) -> None:
+        if self.card_action_callback is None:
+            return
+        try:
+            import lark_oapi as lark
+
+            payload = json.loads(lark.JSON.marshal(data))
+            asyncio.run(self._dispatch_card_action(payload))
+        except Exception:
+            logger.exception("Failed to process Feishu long connection card action event")
+
+    async def _dispatch_card_action(self, payload: dict[str, object]) -> None:
+        if self.card_action_callback is None:
+            return
+        result = self.card_action_callback(payload)
+        if asyncio.iscoroutine(result):
+            await result
 
     def _extract_sender_open_id(self, sender: object) -> str | None:
         if not isinstance(sender, dict):

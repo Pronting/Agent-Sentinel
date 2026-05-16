@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import uuid
 
-from agent_sentinel.feishu.card_handler import HumanDecisionStore
+from langgraph.types import interrupt
+
+from agent_sentinel.feishu.card_handler import DecisionContext, HumanDecisionStore
 from agent_sentinel.feishu.sender import FeishuSender
 from agent_sentinel.graph.state import DiagnosisState, append_evidence, append_message
 
@@ -26,24 +28,47 @@ async def human_confirm_node(
         }
 
     decision_id = state.get("decision_id") or str(uuid.uuid4())
-    await decision_store.register(decision_id)
-    await sender.send_card(
-        state.get("chat_id"),
-        decision_id,
-        state.get("recommended_plan", {}),
-        state.get("evidence", []),
-        thread_root_message_id=state.get("thread_root_message_id"),
+    if not state.get("human_card_sent", False):
+        await decision_store.register_pending_decision(
+            DecisionContext(
+                decision_id=decision_id,
+                workflow_thread_id=state.get("workflow_thread_id", ""),
+                workflow_run_id=state.get("workflow_run_id", ""),
+                chat_id=state.get("chat_id"),
+                thread_root_message_id=state.get("thread_root_message_id"),
+            )
+        )
+        await sender.send_card(
+            state.get("chat_id"),
+            decision_id,
+            state.get("workflow_thread_id", ""),
+            state.get("workflow_run_id", ""),
+            state.get("recommended_plan", {}),
+            state.get("evidence", []),
+            thread_root_message_id=state.get("thread_root_message_id"),
+        )
+
+    resume_payload = interrupt(
+        {
+            "decision_id": decision_id,
+            "workflow_thread_id": state.get("workflow_thread_id", ""),
+            "workflow_run_id": state.get("workflow_run_id", ""),
+            "timeout_seconds": timeout_seconds,
+        }
     )
-    decision = await decision_store.wait_for_decision(decision_id, timeout_seconds)
-    logger.info("Node human_confirm completed decision=%s", decision.decision)
-    evidence = append_evidence(state, f"Human confirmation decision={decision.decision}.")
-    messages = append_message(state, "assistant", f"人工确认结果: {decision.decision}")
-    if decision.decision == "rejected" and decision.feedback:
-        messages = [*messages, {"role": "user", "content": decision.feedback}]
-        evidence = [*evidence, f"Human rejection feedback: {decision.feedback}"]
+    decision = str((resume_payload or {}).get("decision") or "timeout")
+    feedback = str((resume_payload or {}).get("feedback") or "")
+    logger.info("Node human_confirm completed decision=%s", decision)
+    evidence = append_evidence(state, f"Human confirmation decision={decision}.")
+    messages = append_message(state, "assistant", f"人工确认结果: {decision}")
+    if decision == "rejected" and feedback:
+        messages = [*messages, {"role": "user", "content": feedback}]
+        evidence = [*evidence, f"Human rejection feedback: {feedback}"]
     return {
         "decision_id": decision_id,
-        "human_decision": decision.decision,
+        "human_card_sent": True,
+        "human_decision": decision,
+        "human_feedback": feedback or None,
         "messages": messages,
         "evidence": evidence,
     }

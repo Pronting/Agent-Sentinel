@@ -97,10 +97,12 @@ def get_settings() -> Settings:
         openai_base_url=_first_non_empty(
             os.getenv("CODEX_BASE_URL"),
             os.getenv("OPENAI_BASE_URL"),
+            os.getenv("base_url"),
         ),
         openai_model=_first_non_empty(
             os.getenv("CODEX_MODEL"),
             os.getenv("OPENAI_MODEL"),
+            os.getenv("model"),
         )
         or "gpt-4o-mini",
         openai_temperature=_to_float(os.getenv("OPENAI_TEMPERATURE"), 0.0),

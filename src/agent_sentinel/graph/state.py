@@ -17,7 +17,11 @@ class DiagnosisState(TypedDict, total=False):
     thread_root_message_id: str | None
     mention_open_id: str | None
     mention_name: str | None
+    workflow_thread_id: str
+    workflow_run_id: str
     decision_id: str
+    human_card_sent: bool
+    human_feedback: str | None
     human_decision: str
     validation_attempts: int
     final_text: str

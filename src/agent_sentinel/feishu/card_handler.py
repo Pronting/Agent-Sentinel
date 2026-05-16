@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import redis.asyncio as redis
@@ -18,71 +16,87 @@ class HumanDecision:
     feedback: str = ""
 
 
+@dataclass(slots=True)
+class DecisionContext:
+    decision_id: str
+    workflow_thread_id: str
+    workflow_run_id: str
+    chat_id: str | None = None
+    thread_root_message_id: str | None = None
+    status: str = "pending"
+    feedback: str = ""
+
+
 class HumanDecisionStore:
     def __init__(self, redis_url: str | None = None) -> None:
         self.redis_url = redis_url
-        self._futures: dict[str, asyncio.Future[HumanDecision]] = {}
         self._redis: redis.Redis | None = None
+        self._contexts: dict[str, DecisionContext] = {}
 
     async def open(self) -> None:
         if self.redis_url and self._redis is None:
             self._redis = redis.from_url(self.redis_url, decode_responses=True)
 
-    async def register(self, decision_id: str) -> None:
+    async def register_pending_decision(self, context: DecisionContext) -> None:
         await self.open()
-        loop = asyncio.get_running_loop()
-        self._futures.setdefault(decision_id, loop.create_future())
-        if self._redis:
-            await self._redis.setex(f"decision:{decision_id}:status", 600, "pending")
-
-    async def set_decision(self, decision_id: str, decision: str, feedback: str = "") -> None:
-        payload = HumanDecision(decision=decision, feedback=feedback)
-        future = self._futures.get(decision_id)
-        if future and not future.done():
-            future.set_result(payload)
+        self._contexts[context.decision_id] = context
         if self._redis:
             await self._redis.setex(
-                f"decision:{decision_id}:result",
+                f"decision:{context.decision_id}:context",
                 600,
-                json.dumps({"decision": decision, "feedback": feedback}, ensure_ascii=False),
+                json.dumps(asdict(context), ensure_ascii=False),
             )
-        logger.info("Human decision recorded decision_id=%s decision=%s", decision_id, decision)
+        logger.info(
+            "Registered pending human decision decision_id=%s workflow_thread_id=%s",
+            context.decision_id,
+            context.workflow_thread_id,
+        )
 
-    async def wait_for_decision(self, decision_id: str, timeout_seconds: int) -> HumanDecision:
-        await self.register(decision_id)
-        future = self._futures[decision_id]
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            try:
-                return await asyncio.wait_for(asyncio.shield(future), timeout=1)
-            except asyncio.TimeoutError:
-                if self._redis:
-                    raw = await self._redis.get(f"decision:{decision_id}:result")
-                    if raw:
-                        data = json.loads(raw)
-                        return HumanDecision(
-                            decision=str(data.get("decision", "timeout")),
-                            feedback=str(data.get("feedback", "")),
-                        )
-                if time.monotonic() >= deadline:
-                    logger.info("Human decision timed out decision_id=%s", decision_id)
-                    return HumanDecision(decision="timeout", feedback="confirmation timed out")
+    async def get_decision_context(self, decision_id: str) -> DecisionContext | None:
+        await self.open()
+        context = self._contexts.get(decision_id)
+        if context is not None:
+            return context
+        if not self._redis:
+            return None
+        raw = await self._redis.get(f"decision:{decision_id}:context")
+        if not raw:
+            return None
+        data = json.loads(raw)
+        context = DecisionContext(**data)
+        self._contexts[decision_id] = context
+        return context
+
+    async def mark_decision_received(self, decision_id: str, decision: str, feedback: str = "") -> DecisionContext | None:
+        context = await self.get_decision_context(decision_id)
+        if context is None:
+            return None
+        context.status = decision
+        context.feedback = feedback
+        await self.register_pending_decision(context)
+        logger.info("Human decision received decision_id=%s decision=%s", decision_id, decision)
+        return context
 
 
 class FeishuCardHandler:
     def __init__(self, decision_store: HumanDecisionStore) -> None:
         self.decision_store = decision_store
 
-    async def handle(self, payload: dict[str, Any]) -> dict[str, str]:
+    async def parse_callback(self, payload: dict[str, Any]) -> DecisionContext | None:
         value = self._extract_value(payload)
         if value.get("action") != "diagnosis_confirm":
-            return {"status": "ignored"}
+            return None
         decision_id = str(value.get("decision_id") or "")
         decision = str(value.get("decision") or "")
         feedback = str(value.get("feedback") or payload.get("feedback") or "")
         if not decision_id or decision not in {"approved", "rejected"}:
+            return None
+        return await self.decision_store.mark_decision_received(decision_id, decision, feedback)
+
+    async def handle(self, payload: dict[str, Any]) -> dict[str, str]:
+        context = await self.parse_callback(payload)
+        if context is None:
             return {"status": "ignored"}
-        await self.decision_store.set_decision(decision_id, decision, feedback)
         return {"status": "ok"}
 
     def _extract_value(self, payload: dict[str, Any]) -> dict[str, Any]:

@@ -1,4 +1,4 @@
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -94,12 +94,18 @@ def test_feishu_event_challenge() -> None:
 
 def test_alert_analyze_endpoint_prefers_thread_root_message_id() -> None:
     settings = make_settings()
-    with (
-        patch("agent_sentinel.main.AlertAnalysisService") as analysis_cls,
-        patch("agent_sentinel.main.FeishuBotClient") as bot_cls,
-    ):
-        analysis_cls.return_value.analyze_alert.return_value = "[Alert Analysis]\nSeverity: High"
-        bot_cls.return_value.send_text_to_chat.return_value = True
+    with patch("agent_sentinel.main.DiagnosisWorkflow") as workflow_cls:
+        workflow_cls.return_value.run_streaming.return_value = {
+            "alert_summary": "Synthetic alert summary",
+            "recommended_plan": {"summary": "Use workflow path"},
+            "evidence": ["workflow evidence"],
+            "validation_result": True,
+            "human_decision": "approved",
+            "final_text": "[AIOps Diagnosis] final",
+        }
+        workflow_cls.return_value.run_streaming = AsyncMock(
+            return_value=workflow_cls.return_value.run_streaming.return_value
+        )
 
         app = build_app(settings)
         client = TestClient(app)
@@ -126,11 +132,161 @@ def test_alert_analyze_endpoint_prefers_thread_root_message_id() -> None:
         assert response.status_code == 200
         assert response.json()["status"] == "sent"
         assert response.json()["sent_to_feishu"] is True
-        bot_cls.return_value.send_text_to_chat.assert_called_once()
-        _, kwargs = bot_cls.return_value.send_text_to_chat.call_args
-        assert kwargs["thread_root_message_id"] == "om_thread_root"
-        assert kwargs["mention_open_id"] == "ou_user"
-        assert kwargs["mention_name"] == "Fe"
+        assert response.json()["analysis"] == "[AIOps Diagnosis] final"
+        workflow_cls.return_value.run_streaming.assert_called_once()
+        state = workflow_cls.return_value.run_streaming.call_args.args[0]
+        assert state["chat_id"] == "oc_test_chat"
+        assert state["thread_root_message_id"] == "om_thread_root"
+        assert state["mention_open_id"] == "ou_user"
+        assert state["mention_name"] == "Fe"
+        assert state["raw_alert"]["trigger_type"] == "bot_alert"
+
+
+def test_feishu_event_routes_into_langgraph_workflow() -> None:
+    settings = make_settings()
+    settings.feishu_allowed_chat_ids = ["oc_test_chat"]
+    with patch("agent_sentinel.main.DiagnosisWorkflow") as workflow_cls:
+        workflow_cls.return_value.run_streaming.return_value = {
+            "alert_summary": "Feishu alert summary",
+            "recommended_plan": {"summary": "Use workflow path"},
+            "evidence": ["workflow evidence"],
+            "validation_result": True,
+            "human_decision": "approved",
+            "final_text": "[AIOps Diagnosis] final",
+        }
+        workflow_cls.return_value.run_streaming = AsyncMock(
+            return_value=workflow_cls.return_value.run_streaming.return_value
+        )
+
+        app = build_app(settings)
+        client = TestClient(app)
+
+        response = client.post(
+            "/feishu/events",
+            json={
+                "schema": "2.0",
+                "header": {
+                    "event_type": "im.message.receive_v1",
+                    "token": "verify-token",
+                },
+                "event": {
+                    "sender": {
+                        "sender_type": "user",
+                        "sender_id": "ou_user",
+                        "name": "Fe",
+                    },
+                    "message": {
+                        "chat_id": "oc_test_chat",
+                        "message_id": "om_original_message",
+                        "root_id": "om_thread_root",
+                        "mentions": [{"name": "Analysis Bot"}],
+                        "content": '{"text":"@bot help"}',
+                    },
+                },
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+        assert response.json()["sent_to_feishu"] is True
+        workflow_cls.return_value.run_streaming.assert_called_once()
+        state = workflow_cls.return_value.run_streaming.call_args.args[0]
+        assert state["chat_id"] == "oc_test_chat"
+        assert state["thread_root_message_id"] == "om_thread_root"
+        assert state["mention_open_id"] == "ou_user"
+        assert state["mention_name"] == "Fe"
+        assert state["workflow_thread_id"]
+        assert state["workflow_run_id"]
+        assert state["raw_alert"]["source"] == "feishu-user"
+        assert state["raw_alert"]["details"] == "@bot help"
+        assert state["raw_alert"]["trigger_type"] == "user_message"
+
+
+def test_feishu_card_callback_resumes_workflow() -> None:
+    settings = make_settings()
+    with (
+        patch("agent_sentinel.main.DiagnosisWorkflow") as workflow_cls,
+        patch("agent_sentinel.main.FeishuCardHandler.parse_callback") as parse_callback,
+    ):
+        parse_callback.return_value = Mock(
+            decision_id="decision-1",
+            workflow_thread_id="wf-1",
+            workflow_run_id="run-1",
+            status="approved",
+            feedback="",
+        )
+        parse_callback.side_effect = AsyncMock(return_value=parse_callback.return_value)
+        workflow_cls.return_value.resume = AsyncMock(return_value={"human_decision": "approved"})
+        workflow_cls.return_value.update_state = AsyncMock(return_value=None)
+
+        app = build_app(settings)
+        client = TestClient(app)
+
+        response = client.post(
+            "/feishu/card/callback",
+            json={
+                "action": {
+                    "value": {
+                        "action": "diagnosis_confirm",
+                        "decision": "approved",
+                        "decision_id": "decision-1",
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        workflow_cls.return_value.update_state.assert_not_awaited()
+        workflow_cls.return_value.resume.assert_awaited_once_with(
+            "wf-1",
+            {"decision": "approved", "feedback": ""},
+        )
+
+
+def test_feishu_card_callback_updates_feedback_before_resume() -> None:
+    settings = make_settings()
+    with (
+        patch("agent_sentinel.main.DiagnosisWorkflow") as workflow_cls,
+        patch("agent_sentinel.main.FeishuCardHandler.parse_callback") as parse_callback,
+    ):
+        parse_callback.return_value = Mock(
+            decision_id="decision-2",
+            workflow_thread_id="wf-2",
+            workflow_run_id="run-2",
+            status="rejected",
+            feedback="请补充风险说明",
+        )
+        parse_callback.side_effect = AsyncMock(return_value=parse_callback.return_value)
+        workflow_cls.return_value.resume = AsyncMock(return_value={"human_decision": "rejected"})
+        workflow_cls.return_value.update_state = AsyncMock(return_value=None)
+
+        app = build_app(settings)
+        client = TestClient(app)
+
+        response = client.post(
+            "/feishu/card/callback",
+            json={
+                "action": {
+                    "value": {
+                        "action": "diagnosis_confirm",
+                        "decision": "rejected",
+                        "decision_id": "decision-2",
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        workflow_cls.return_value.update_state.assert_awaited_once_with(
+            "wf-2",
+            {"human_feedback": "请补充风险说明"},
+        )
+        workflow_cls.return_value.resume.assert_awaited_once_with(
+            "wf-2",
+            {"decision": "rejected", "feedback": "请补充风险说明"},
+        )
 
 
 def test_feishu_bot_client_uses_reply_endpoint_for_thread_reply() -> None:
@@ -163,3 +319,61 @@ def test_feishu_bot_client_uses_reply_endpoint_for_thread_reply() -> None:
     send_args, send_kwargs = post_mock.call_args_list[1]
     assert send_args[0].endswith("/open-apis/im/v1/messages/om_thread_root/reply")
     assert send_kwargs["json"]["receive_id"] == "oc_test_chat"
+    assert send_kwargs["json"]["reply_in_thread"] is True
+
+
+def test_feishu_bot_client_uses_thread_reply_for_interactive_cards() -> None:
+    settings = make_settings()
+    client = FeishuBotClient(settings)
+
+    token_response = Mock()
+    token_response.raise_for_status.return_value = None
+    token_response.json.return_value = {
+        "code": 0,
+        "tenant_access_token": "tenant-token",
+        "expire": 7200,
+    }
+
+    send_response = Mock()
+    send_response.raise_for_status.return_value = None
+    send_response.json.return_value = {"code": 0}
+
+    with patch("agent_sentinel.feishu_app.requests.post", side_effect=[token_response, send_response]) as post_mock:
+        result = client.send_interactive_card_to_chat(
+            "oc_test_chat",
+            {"config": {"wide_screen_mode": True}},
+            thread_root_message_id="om_thread_root",
+        )
+
+    assert result is True
+    assert post_mock.call_count == 2
+    send_args, send_kwargs = post_mock.call_args_list[1]
+    assert send_args[0].endswith("/open-apis/im/v1/messages/om_thread_root/reply")
+    assert send_kwargs["json"]["msg_type"] == "interactive"
+    assert send_kwargs["json"]["reply_in_thread"] is True
+
+
+def test_feishu_bot_client_keeps_top_level_send_without_thread_flag() -> None:
+    settings = make_settings()
+    client = FeishuBotClient(settings)
+
+    token_response = Mock()
+    token_response.raise_for_status.return_value = None
+    token_response.json.return_value = {
+        "code": 0,
+        "tenant_access_token": "tenant-token",
+        "expire": 7200,
+    }
+
+    send_response = Mock()
+    send_response.raise_for_status.return_value = None
+    send_response.json.return_value = {"code": 0}
+
+    with patch("agent_sentinel.feishu_app.requests.post", side_effect=[token_response, send_response]) as post_mock:
+        result = client.send_text_to_chat("oc_test_chat", "analysis body")
+
+    assert result is True
+    assert post_mock.call_count == 2
+    send_args, send_kwargs = post_mock.call_args_list[1]
+    assert send_args[0].endswith("/open-apis/im/v1/messages?receive_id_type=chat_id")
+    assert "reply_in_thread" not in send_kwargs["json"]

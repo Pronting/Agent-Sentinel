@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
+import uuid
 from typing import Any
 
 import uvicorn
@@ -115,16 +117,51 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         except Exception as notify_exc:  # pragma: no cover
             logger.exception("Failed to send Feishu alert for %s: %s", scene, notify_exc)
 
-    def build_analysis_message(source: str, level: str, summary: str, analysis: str) -> str:
-        return (
-            f"[{settings.alert_analysis_title_prefix}]\n"
-            f"Source: {source}\n"
-            f"Level: {level}\n"
-            f"Summary: {summary}\n\n"
-            f"{analysis}"
-        )
+    def build_diagnosis_state(
+        *,
+        chat_id: str,
+        source: str,
+        level: str,
+        summary: str,
+        details: str | None = None,
+        raw_text: str | None = None,
+        trigger_type: str = "unknown",
+        tags: list[str] | None = None,
+        thread_root_message_id: str | None = None,
+        mention_open_id: str | None = None,
+        mention_name: str | None = None,
+        workflow_thread_id: str | None = None,
+        workflow_run_id: str | None = None,
+    ) -> DiagnosisState:
+        return {
+            "raw_alert": {
+                "source": source,
+                "level": level,
+                "summary": summary,
+                "details": details,
+                "raw_text": raw_text,
+                "trigger_type": trigger_type,
+                "tags": tags,
+            },
+            "chat_id": chat_id,
+            "thread_root_message_id": thread_root_message_id,
+            "mention_open_id": mention_open_id,
+            "mention_name": mention_name,
+            "workflow_thread_id": workflow_thread_id or str(uuid.uuid4()),
+            "workflow_run_id": workflow_run_id or str(uuid.uuid4()),
+            "messages": [],
+            "evidence": [],
+            "retrieved_docs": [],
+            "live_data": {},
+            "recommended_plan": {},
+            "validation_result": False,
+            "need_human": True,
+            "human_card_sent": False,
+            "human_feedback": None,
+        }
 
-    def analyze_and_send_to_chat(
+    async def run_workflow_and_send(
+        *,
         chat_id: str,
         source: str,
         level: str,
@@ -140,7 +177,8 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         if not settings.alert_analysis_enabled:
             return "Alert analysis is disabled.", False
 
-        analysis = get_analysis_service().analyze_alert(
+        initial_state = build_diagnosis_state(
+            chat_id=chat_id,
             source=source,
             level=level,
             summary=summary,
@@ -148,15 +186,92 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             raw_text=raw_text,
             trigger_type=trigger_type,
             tags=tags,
-        )
-        sent = feishu_bot_client.send_text_to_chat(
-            chat_id,
-            build_analysis_message(source, level, summary, analysis),
             thread_root_message_id=thread_root_message_id,
             mention_open_id=mention_open_id,
             mention_name=mention_name,
         )
-        return analysis, sent
+        logger.info(
+            "Starting Feishu LangGraph workflow source=%s level=%s trigger_type=%s chat_id=%s thread_root_message_id=%s workflow_thread_id=%s summary=%s",
+            source,
+            level,
+            trigger_type,
+            chat_id,
+            thread_root_message_id,
+            initial_state.get("workflow_thread_id", ""),
+            summary,
+        )
+        final_state = await get_aiops_workflow().run_streaming(initial_state)
+        final_text = str(final_state.get("final_text", ""))
+        sent = bool(chat_id and feishu_bot_client.is_configured())
+        logger.info(
+            "Completed Feishu LangGraph workflow source=%s trigger_type=%s chat_id=%s workflow_thread_id=%s validation_result=%s human_decision=%s evidence=%s final_text_chars=%s",
+            source,
+            trigger_type,
+            chat_id,
+            final_state.get("workflow_thread_id", ""),
+            final_state.get("validation_result", False),
+            final_state.get("human_decision", "unknown"),
+            len(final_state.get("evidence", [])),
+            len(final_text),
+        )
+        return final_text, sent
+
+    async def resume_workflow_from_callback(payload: dict[str, Any], transport: str) -> dict[str, str]:
+        context = await card_handler.parse_callback(payload)
+        if context is None:
+            return {"status": "ignored"}
+        logger.info(
+            "Received Feishu card callback transport=%s decision_id=%s workflow_thread_id=%s status=%s",
+            transport,
+            context.decision_id,
+            context.workflow_thread_id,
+            context.status,
+        )
+        if context.feedback:
+            await get_aiops_workflow().update_state(
+                context.workflow_thread_id,
+                {"human_feedback": context.feedback},
+            )
+        await get_aiops_workflow().resume(
+            context.workflow_thread_id,
+            {"decision": context.status, "feedback": context.feedback},
+        )
+        logger.info(
+            "Resumed workflow from Feishu callback transport=%s decision_id=%s workflow_thread_id=%s",
+            transport,
+            context.decision_id,
+            context.workflow_thread_id,
+        )
+        return {"status": "ok"}
+
+    def analyze_and_send_to_chat(
+        chat_id: str,
+        source: str,
+        level: str,
+        summary: str,
+        details: str | None = None,
+        raw_text: str | None = None,
+        trigger_type: str = "unknown",
+        tags: list[str] | None = None,
+        thread_root_message_id: str | None = None,
+        mention_open_id: str | None = None,
+        mention_name: str | None = None,
+    ) -> tuple[str, bool]:
+        return asyncio.run(
+            run_workflow_and_send(
+                chat_id=chat_id,
+                source=source,
+                level=level,
+                summary=summary,
+                details=details,
+                raw_text=raw_text,
+                trigger_type=trigger_type,
+                tags=tags,
+                thread_root_message_id=thread_root_message_id,
+                mention_open_id=mention_open_id,
+                mention_name=mention_name,
+            )
+        )
 
     @app.on_event("startup")
     def startup_event() -> None:
@@ -165,6 +280,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             longconn_bot = FeishuLongConnectionBot(
                 settings=settings,
                 analyze_callback=analyze_and_send_to_chat,
+                card_action_callback=lambda payload: resume_workflow_from_callback(payload, transport="longconn"),
             )
         longconn_bot.start()
 
@@ -243,14 +359,14 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         return [AlertRecordResponse(**item) for item in alert_service.recent_alerts(limit=limit)]
 
     @app.post("/alerts/analyze", response_model=AlertAnalyzeResponse)
-    def analyze_alert(
+    async def analyze_alert(
         payload: AlertAnalyzeRequest,
         x_alert_token: str | None = Header(default=None),
     ) -> AlertAnalyzeResponse:
         try:
             verify_alert_token(x_alert_token)
             thread_root_message_id = payload.thread_root_message_id or payload.message_id
-            analysis, sent = analyze_and_send_to_chat(
+            analysis, sent = await run_workflow_and_send(
                 chat_id=payload.chat_id,
                 source=payload.source,
                 level=payload.level,
@@ -282,29 +398,40 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         try:
             verify_alert_token(x_alert_token)
-            initial_state: DiagnosisState = {
-                "raw_alert": {
-                    "source": payload.source,
-                    "level": payload.level,
-                    "summary": payload.summary,
-                    "details": payload.details,
-                    "raw_text": payload.raw_text,
-                    "trigger_type": payload.trigger_type,
-                    "tags": payload.tags,
-                },
-                "chat_id": payload.chat_id,
-                "thread_root_message_id": payload.thread_root_message_id or payload.message_id,
-                "mention_open_id": payload.mention_open_id,
-                "mention_name": payload.mention_name,
-                "messages": [],
-                "evidence": [],
-                "retrieved_docs": [],
-                "live_data": {},
-                "recommended_plan": {},
-                "validation_result": False,
-                "need_human": True,
-            }
+            initial_state = build_diagnosis_state(
+                chat_id=payload.chat_id,
+                source=payload.source,
+                level=payload.level,
+                summary=payload.summary,
+                details=payload.details,
+                raw_text=payload.raw_text,
+                trigger_type=payload.trigger_type,
+                tags=payload.tags,
+                thread_root_message_id=payload.thread_root_message_id or payload.message_id,
+                mention_open_id=payload.mention_open_id,
+                mention_name=payload.mention_name,
+            )
+            logger.info(
+                "Starting direct LangGraph diagnosis source=%s level=%s trigger_type=%s chat_id=%s thread_root_message_id=%s workflow_thread_id=%s summary=%s",
+                payload.source,
+                payload.level,
+                payload.trigger_type,
+                payload.chat_id,
+                payload.thread_root_message_id or payload.message_id,
+                initial_state.get("workflow_thread_id", ""),
+                payload.summary,
+            )
             final_state = await get_aiops_workflow().run_streaming(initial_state)
+            logger.info(
+                "Completed direct LangGraph diagnosis source=%s trigger_type=%s chat_id=%s validation_result=%s human_decision=%s evidence=%s final_text_chars=%s",
+                payload.source,
+                payload.trigger_type,
+                payload.chat_id,
+                final_state.get("validation_result", False),
+                final_state.get("human_decision", "unknown"),
+                len(final_state.get("evidence", [])),
+                len(str(final_state.get("final_text", ""))),
+            )
             return {
                 "status": "ok",
                 "summary": final_state.get("alert_summary", ""),
@@ -325,13 +452,13 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     async def feishu_card_callback(request: Request) -> dict[str, str]:
         try:
             payload = await request.json()
-            return await card_handler.handle(payload)
+            return await resume_workflow_from_callback(payload, transport="http")
         except Exception as exc:
             logger.exception("Failed to process Feishu card callback")
             raise HTTPException(status_code=500, detail="Failed to process card callback.") from exc
 
     @app.post("/feishu/events")
-    def feishu_events(payload: FeishuEventEnvelope) -> dict[str, object]:
+    async def feishu_events(payload: FeishuEventEnvelope) -> dict[str, object]:
         try:
             if payload.challenge:
                 return {"challenge": payload.challenge}
@@ -386,7 +513,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                 or str(message.get("message_id") or "").strip()
                 or None
             )
-            analysis, sent = analyze_and_send_to_chat(
+            analysis, sent = await run_workflow_and_send(
                 chat_id=chat_id,
                 source="feishu-user",
                 level="INFO",

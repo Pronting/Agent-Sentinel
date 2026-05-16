@@ -38,6 +38,8 @@ class FeishuSender:
         self,
         chat_id: str | None,
         decision_id: str,
+        workflow_thread_id: str,
+        workflow_run_id: str,
         plan: dict[str, Any],
         evidence: list[str],
         *,
@@ -46,7 +48,7 @@ class FeishuSender:
         if not chat_id or not self.client or not self.client.is_configured():
             logger.info("Feishu card skipped chat_id=%s decision_id=%s", chat_id, decision_id)
             return False
-        card = build_confirmation_card(decision_id, plan, evidence)
+        card = build_confirmation_card(decision_id, workflow_thread_id, workflow_run_id, plan, evidence)
         return await asyncio.to_thread(
             self.client.send_interactive_card_to_chat,
             chat_id,
@@ -55,7 +57,13 @@ class FeishuSender:
         )
 
 
-def build_confirmation_card(decision_id: str, plan: dict[str, Any], evidence: list[str]) -> dict[str, Any]:
+def build_confirmation_card(
+    decision_id: str,
+    workflow_thread_id: str,
+    workflow_run_id: str,
+    plan: dict[str, Any],
+    evidence: list[str],
+) -> dict[str, Any]:
     plan_summary = str(plan.get("summary") or plan)[:900]
     evidence_text = "\n".join(f"- {item}" for item in evidence[:8]) or "- no evidence"
     return {
@@ -78,6 +86,8 @@ def build_confirmation_card(decision_id: str, plan: dict[str, Any], evidence: li
                             "action": "diagnosis_confirm",
                             "decision": "approved",
                             "decision_id": decision_id,
+                            "workflow_thread_id": workflow_thread_id,
+                            "workflow_run_id": workflow_run_id,
                         },
                     },
                     {
@@ -88,6 +98,8 @@ def build_confirmation_card(decision_id: str, plan: dict[str, Any], evidence: li
                             "action": "diagnosis_confirm",
                             "decision": "rejected",
                             "decision_id": decision_id,
+                            "workflow_thread_id": workflow_thread_id,
+                            "workflow_run_id": workflow_run_id,
                         },
                     },
                 ],

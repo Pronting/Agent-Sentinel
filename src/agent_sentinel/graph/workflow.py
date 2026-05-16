@@ -5,7 +5,9 @@ from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any
 
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
+from langgraph.types import Command
 
 from agent_sentinel.agents.fetch_tools import fetch_live_data_node
 from agent_sentinel.agents.final_result import final_result_node
@@ -36,14 +38,19 @@ class DiagnosisWorkflow:
         sender: FeishuSender,
         decision_store: HumanDecisionStore,
         retriever: MockRetriever | None = None,
+        checkpointer: Any | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm
         self.sender = sender
         self.decision_store = decision_store
         self.retriever = retriever or MockRetriever()
+        self.checkpointer = checkpointer or InMemorySaver()
+        self._compiled: Any | None = None
 
     def compile(self) -> Any:
+        if self._compiled is not None:
+            return self._compiled
         workflow_config = load_yaml(self.settings.aiops_workflow_config_path)
         graph = StateGraph(DiagnosisState)
         registry = self._node_registry()
@@ -70,23 +77,65 @@ class DiagnosisWorkflow:
             }
             graph.add_conditional_edges(source, route_registry[condition_name], mapping)
 
-        compiled = graph.compile()
+        self._compiled = graph.compile(checkpointer=self.checkpointer)
         logger.info("LangGraph workflow compiled nodes=%s", [item["name"] for item in nodes])
-        return compiled
+        return self._compiled
 
     async def run_streaming(self, initial_state: DiagnosisState) -> DiagnosisState:
         app = self.compile()
+        workflow_thread_id = initial_state.get("workflow_thread_id", "")
+        config = {
+            "configurable": {"thread_id": workflow_thread_id},
+            "recursion_limit": 20,
+        }
         final_state: DiagnosisState = dict(initial_state)
         async for update in app.astream(
             initial_state,
-            config={"recursion_limit": 20},
+            config=config,
             stream_mode="updates",
         ):
             for node_name, node_update in update.items():
                 if isinstance(node_update, dict):
                     final_state.update(node_update)
                 await self._send_progress(node_name, final_state)
+        state_snapshot = await app.aget_state(config)
+        final_values = getattr(state_snapshot, "values", None)
+        if isinstance(final_values, dict):
+            final_state.update(final_values)
         return final_state
+
+    async def resume(self, workflow_thread_id: str, resume_payload: dict[str, Any]) -> DiagnosisState:
+        app = self.compile()
+        config = {
+            "configurable": {"thread_id": workflow_thread_id},
+            "recursion_limit": 20,
+        }
+        state_snapshot = await app.aget_state(config)
+        final_state: DiagnosisState = {}
+        values = getattr(state_snapshot, "values", None)
+        if isinstance(values, dict):
+            final_state.update(values)
+        async for update in app.astream(
+            Command(resume=resume_payload),
+            config=config,
+            stream_mode="updates",
+        ):
+            for node_name, node_update in update.items():
+                if isinstance(node_update, dict):
+                    final_state.update(node_update)
+                await self._send_progress(node_name, final_state)
+        state_snapshot = await app.aget_state(config)
+        final_values = getattr(state_snapshot, "values", None)
+        if isinstance(final_values, dict):
+            final_state.update(final_values)
+        return final_state
+
+    async def update_state(self, workflow_thread_id: str, state_update: dict[str, Any]) -> None:
+        app = self.compile()
+        await app.aupdate_state(
+            {"configurable": {"thread_id": workflow_thread_id}, "recursion_limit": 20},
+            state_update,
+        )
 
     def _node_registry(self) -> dict[str, NodeFn]:
         return {
@@ -126,6 +175,13 @@ class DiagnosisWorkflow:
         }.get(node_name)
         if not status:
             return
+        logger.info(
+            "Sending workflow progress node=%s chat_id=%s thread_root_message_id=%s status=%s",
+            node_name,
+            state.get("chat_id"),
+            state.get("thread_root_message_id"),
+            status,
+        )
         await self.sender.send_message(
             state.get("chat_id"),
             status,

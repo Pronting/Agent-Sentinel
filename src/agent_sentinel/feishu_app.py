@@ -50,6 +50,7 @@ class FeishuBotClient:
 
         if thread_root_message_id:
             url = f"{base_url}/{thread_root_message_id}/reply"
+            payload["reply_in_thread"] = True
         else:
             url = f"{base_url}?receive_id_type=chat_id"
 
@@ -86,6 +87,7 @@ class FeishuBotClient:
         }
         if thread_root_message_id:
             url = f"{base_url}/{thread_root_message_id}/reply"
+            payload["reply_in_thread"] = True
         else:
             url = f"{base_url}?receive_id_type=chat_id"
 
