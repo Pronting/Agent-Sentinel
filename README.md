@@ -1,55 +1,12 @@
 # Agent Sentinel
 
-## 飞书 LangGraph 交互式话题流程
+Agent Sentinel 是一个基于 FastAPI、LangGraph、LangChain、飞书机器人和 Milvus 的 AIOps 告警诊断系统。当前版本重点支持：
 
-服务支持“群内 @ 机器人 -> 原消息下创建话题 -> LangGraph 节点逐步确认”的交互模式。开启后，用户在飞书群 @ 机器人，机器人会在原消息 Thread 中执行示例流程：
-
-```text
-cache_check -> rag_retrieve -> tool_call -> summary
-```
-
-每个节点会先发送“正在执行 XX 节点...”，节点完成后发送一张 Yes/No 确认卡片：
-
-- `Yes 下一步`：确认当前节点结果，进入下一个节点。
-- `No 重试节点`：拒绝当前节点结果，重新执行当前节点。
-- 5 秒未操作：自动视为 Yes，并在话题中发送“超时未操作，自动继续”。
-
-关键配置：
-
-```env
-FEISHU_APP_ID=your-feishu-app-id
-FEISHU_APP_SECRET=your-feishu-app-secret
-FEISHU_LONG_CONNECTION_ENABLED=true
-FEISHU_MESSAGE_POLLING_ENABLED=false
-FEISHU_ANALYZE_MENTION_ONLY=true
-FEISHU_ALLOWED_CHAT_IDS=oc_xxx
-INTERACTIVE_TOPIC_ENABLED=true
-INTERACTIVE_TOPIC_WAIT_SECONDS=5
-```
-
-飞书开放平台需要启用机器人能力、消息接收事件 `im.message.receive_v1`、卡片回调事件 `card.action.triggered`，并把机器人加入目标群。长连接模式不需要公网事件回调地址；如果你使用 HTTP 卡片回调，也可以配置：
-
-```text
-https://你的公网域名/webhook/card
-```
-
-启动：
-
-```bash
-python -m agent_sentinel.main
-```
-
-Agent Sentinel 是一个基于 FastAPI + LangChain + LangGraph 的多 Agent 智能告警诊断服务。它保留原有飞书消息接入、告警上报、简单对话接口，同时新增一条 AIOps 诊断工作流：
-
-1. 飞书或 HTTP 告警接入
-2. 告警理解与摘要
-3. Mock RAG 历史案例检索
-4. 条件路由判断是否需要实时数据
-5. 并发调用 Mock 指标、日志、拓扑工具
-6. 生成带证据链的诊断方案
-7. 规则 + 轻量 LLM 校验
-8. 飞书交互卡片人工确认
-9. 流式推送中间状态并发送最终结果
+- 飞书群内 @ 机器人后，在原消息话题中使用单张交互卡片动态更新诊断进度。
+- LangGraph 多节点诊断流：告警理解（缓存查找） -> RAG检索 -> 实时数据 -> 方案生成 -> 方案校验 -> 人工确认 -> 反馈学习。
+- Milvus 静态知识库 `aiops_static_docs` 和历史成功案例库 `aiops_message_history`。
+- Markdown 故障手册切片、元数据提取和向量入库。
+- 历史成功案例缓存复用，以及用户确认有效后的反馈入库。
 
 ## 项目结构
 
@@ -60,23 +17,18 @@ Agent Sentinel 是一个基于 FastAPI + LangChain + LangGraph 的多 Agent 智�
 │  ├─ workflow.yaml
 │  ├─ .env.example
 │  └─ prompts/
-│     ├─ understand.yaml
-│     ├─ generate_plan.yaml
-│     └─ validate.yaml
+├─ data/
+│  └─ static_docs/
+├─ scripts/
 ├─ src/
-│  ├─ main.py
 │  └─ agent_sentinel/
 │     ├─ agents/
 │     ├─ feishu/
 │     ├─ graph/
-│     ├─ llm/
+│     ├─ interactive_topic/
 │     ├─ rag/
-│     ├─ tools/
-│     ├─ utils/
-│     └─ main.py
+│     └─ tools/
 ├─ tests/
-│  ├─ test_health.py
-│  └─ test_workflow.py
 ├─ Dockerfile
 ├─ docker-compose.yml
 ├─ pyproject.toml
@@ -93,13 +45,6 @@ pip install -e .[dev]
 copy config\.env.example .env
 ```
 
-先用 Mock LLM 跑通流程时，保持：
-
-```env
-AIOPS_MOCK_LLM_ENABLED=true
-AIOPS_HUMAN_CONFIRM_ENABLED=false
-```
-
 启动服务：
 
 ```powershell
@@ -112,46 +57,83 @@ AIOPS_HUMAN_CONFIRM_ENABLED=false
 curl http://127.0.0.1:8000/health
 ```
 
-## AIOps 诊断演示
+## Docker / ACR
 
-```powershell
-curl -X POST http://127.0.0.1:8000/aiops/diagnose ^
-  -H "Content-Type: application/json" ^
-  -H "X-Alert-Token: replace-with-a-strong-token" ^
-  -d "{\"chat_id\":\"\",\"source\":\"alert-bot\",\"level\":\"ERROR\",\"summary\":\"订单同步超时\",\"details\":\"timeout after 3 retries\",\"raw_text\":\"[ALERT] order sync timeout\",\"trigger_type\":\"bot_alert\",\"tags\":[\"prod\",\"order\"]}"
+本地构建：
+
+```bash
+docker build -t crpi-zzm4e139q0k3kyai.cn-hangzhou.personal.cr.aliyuncs.com/novamate/agentsentinel:rag .
 ```
 
-`chat_id` 为空时不会真实发送飞书消息，但会完整执行 LangGraph 流程。接入真实飞书群时填入 `chat_id`，并配置 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`。
+服务器拉取当前镜像：
 
-## Docker 运行
-
-```powershell
-copy config\.env.example .env
-docker compose up --build
+```bash
+docker pull crpi-zzm4e139q0k3kyai.cn-hangzhou.personal.cr.aliyuncs.com/novamate/agentsentinel:rag
 ```
 
-Compose 会启动 Redis 和 app。Redis 当前用于保存人工确认决策，后续可以替换为 LangGraph checkpoint 持久化。
+## 飞书单卡片交互流程
 
-## 关键配置
+开启 `INTERACTIVE_TOPIC_ENABLED=true` 后，用户在飞书群 @ 机器人，系统会在原消息话题中创建一张“智能诊断工作流”卡片，并持续 PATCH 更新同一张卡片，避免群聊刷屏。
 
-`config/settings.yaml` 提供默认配置，`.env` 会覆盖敏感项和部署差异：
+当前卡片步骤：
+
+```text
+1. 告警理解（缓存查找）
+2. RAG检索
+3. 实时数据
+4. 方案生成
+```
+
+每个节点会显示状态：
+
+- `✅ 已完成`
+- `🔄 正在执行`
+- `⏸ 等待确认`
+- `⏭ 已跳过`
+- `❌ 失败`
+
+节点完成后，卡片会出现“同意”和“拒绝”按钮：
+
+- 同意：进入下一节点。
+- 拒绝：重试当前节点。
+- 重试 2 次后：自动跳过当前节点并进入下一节点。
+- 超时未操作：按现有逻辑自动继续。
+
+最终诊断结果会继续显示在同一张卡片上，并增加反馈按钮：
+
+- `✅ 有效，存入知识库`
+- `❌ 无效，不存储`
+
+点击“有效”后，本次告警、RAG 结果、工具数据、最终方案、证据链会写入 `aiops_message_history`，作为后续相似告警的历史成功案例。
+
+关键配置：
 
 ```env
-OPENAI_API_KEY=your-openai-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o-mini
-AIOPS_LLM_MODELS=gpt-4o-mini,gpt-3.5-turbo
-AIOPS_MOCK_LLM_ENABLED=false
-AIOPS_HUMAN_CONFIRM_ENABLED=true
-AIOPS_HUMAN_CONFIRM_TIMEOUT_SECONDS=300
-REDIS_URL=redis://localhost:6379/0
+FEISHU_APP_ID=your-feishu-app-id
+FEISHU_APP_SECRET=your-feishu-app-secret
+FEISHU_LONG_CONNECTION_ENABLED=true
+FEISHU_MESSAGE_POLLING_ENABLED=false
+FEISHU_ANALYZE_MENTION_ONLY=true
+FEISHU_ALLOWED_CHAT_IDS=oc_xxx
+INTERACTIVE_TOPIC_ENABLED=true
+INTERACTIVE_TOPIC_WAIT_SECONDS=15
 ```
 
-多模型降级由 `AIOPS_LLM_MODELS` 控制，按顺序尝试。`LLMExecutor` 会记录模型、耗时、prompt/response 字符数，并在主模型失败后切到备用模型。
+飞书开放平台需要启用：
 
-## Workflow YAML
+- 机器人能力
+- 消息接收事件 `im.message.receive_v1`
+- 卡片回调事件 `card.action.triggered`
 
-`config/workflow.yaml` 描述 LangGraph 拓扑：
+长连接模式不需要公网事件回调地址。HTTP 回调模式可配置：
+
+```text
+https://你的公网域名/webhook/card
+```
+
+## LangGraph 诊断流
+
+主诊断流由 `config/workflow.yaml` 配置，当前节点包括：
 
 ```yaml
 nodes:
@@ -162,150 +144,167 @@ nodes:
   - name: validate
   - name: human_confirm
   - name: final_result
-edges:
-  - from: understand
-    to: retrieve
-conditional_edges:
-  - from: retrieve
-    condition: should_fetch
-    mapping:
-      fetch: fetch_live_data
-      skip: generate_plan
+  - name: feedback_learning
 ```
 
-代码在 `agent_sentinel.graph.workflow.DiagnosisWorkflow` 中读取该文件，动态注册节点和条件路由。新增节点时，需要在 YAML 中声明，并在 `_node_registry()` 中注册函数。
+关键路由：
 
-## Prompt 外部化
+- `understand` 命中历史缓存后，可直接进入 `final_result`，跳过后续节点。
+- `retrieve` 会根据告警内容决定是否调用实时工具。
+- `validate` 校验失败会回到 `generate_plan`，重试超过逻辑上限后继续。
+- `human_confirm` 拒绝会回到 `generate_plan`。
+- `final_result` 后进入 `feedback_learning`，由用户决定是否写入历史案例库。
 
-节点 Prompt 存放在 `config/prompts/`：
+## Milvus 集合
 
-- `understand.yaml`: 告警理解
-- `generate_plan.yaml`: 诊断方案与证据链
-- `validate.yaml`: 方案校验
+### `aiops_static_docs`
 
-Prompt 使用 `{raw_alert}`、`{alert_summary}`、`{live_data}` 等变量渲染，后续可直接替换模板而无需改节点代码。
+用于存储静态故障手册、SOP、Runbook、FAQ。
 
-## 飞书交互卡片
+### `aiops_message_history`
 
-启用人工确认：
-
-```env
-AIOPS_HUMAN_CONFIRM_ENABLED=true
-AIOPS_HUMAN_CONFIRM_TIMEOUT_SECONDS=300
-```
-
-服务会通过 `FeishuSender.send_card()` 发送交互卡片，包含“同意”和“拒绝”按钮。飞书后台卡片回调地址配置为：
+用于存储历史成功案例，字段包括：
 
 ```text
-POST http(s)://你的域名/feishu/card/callback
+id: VARCHAR(256) primary key
+text: VARCHAR(65535)
+embedding: FLOAT_VECTOR(dim=EMBEDDING_DIMENSION)
+doc_type: VARCHAR(64)
+title: VARCHAR(512)
+service: VARCHAR(128)
+component: VARCHAR(128)
+tags: VARCHAR(1024)
+version: VARCHAR(64)
+updated_at: INT64
+created_at: INT64
+source_uri: VARCHAR(1024)
+source: VARCHAR(1024)
+metadata: VARCHAR(8192)
 ```
 
-回调示例：
+历史成功案例统一使用：
 
-```json
-{
-  "action": {
-    "value": {
-      "action": "diagnosis_confirm",
-      "decision_id": "uuid",
-      "decision": "approved"
-    }
-  }
-}
+```text
+doc_type = "alert_case"
 ```
 
-拒绝时可带 `feedback` 字段，工作流会把反馈写入 `messages` 并重新进入 `generate_plan`。5 分钟未确认会自动视为 `timeout`，并发送当前最终结果。
+系统写入 Milvus 前会对 VARCHAR 字段按 UTF-8 字节安全截断，避免中文内容超过 Milvus 字段长度限制。
 
-## RAG 和工具替换
+## RAG 配置
 
-RAG 默认仍是 Mock 空实现：
-
-```python
-class MockRetriever:
-    async def retrieve(self, query: str) -> list[str]:
-        return []
-```
-
-现在已经预留 Milvus + MMR 的双 RAG 链路：
-
-- 固定文本 RAG：`aiops_static_docs`，适合 SOP、Runbook、FAQ、架构说明。
-- 历史消息 RAG：`aiops_message_history`，适合飞书群消息、历史告警、诊断结果和变更上下文。
-- 合并策略：两个 retriever 并发召回，按权重合并，再做 MMR 去冗余。
-
-启用 Milvus：
+当前默认使用 Top2：
 
 ```env
 RAG_PROVIDER=milvus
-MILVUS_URI=http://localhost:19530
-EMBEDDING_API_KEY=your-embedding-api-key
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_MODEL=text-embedding-3-small
-```
-
-本地只想验证链路但不调真实 embedding 时：
-
-```env
-RAG_PROVIDER=milvus
-MILVUS_URI=http://localhost:19530
-EMBEDDING_MOCK_ENABLED=true
-```
-
-关键参数：
-
-```env
-RAG_FINAL_TOP_K=6
+RAG_FINAL_TOP_K=2
 RAG_MMR_LAMBDA=0.55
+
+RAG_STATIC_ENABLED=true
 RAG_STATIC_COLLECTION=aiops_static_docs
-RAG_STATIC_TOP_K=8
+RAG_STATIC_TOP_K=2
 RAG_STATIC_WEIGHT=0.55
+
+RAG_MESSAGE_ENABLED=true
 RAG_MESSAGE_COLLECTION=aiops_message_history
-RAG_MESSAGE_TOP_K=12
+RAG_MESSAGE_TOP_K=2
 RAG_MESSAGE_WEIGHT=0.45
 RAG_MESSAGE_DEFAULT_DAYS=30
+
+RAG_CASE_CACHE_ENABLED=true
+RAG_CASE_CACHE_THRESHOLD=0.85
+RAG_CASE_CACHE_TOP_K=2
+RAG_FEEDBACK_ENABLED=true
 ```
 
-Milvus 不可用或 `MILVUS_URI` 未配置时，系统会自动降级到 Mock RAG，不中断诊断工作流。
+嵌入模型配置示例：
 
-固定文本上传流程：
+```env
+EMBEDDING_API_KEY=your-embedding-api-key
+EMBEDDING_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+EMBEDDING_MODEL=text-embedding-v4
+EMBEDDING_DIMENSION=1024
+EMBEDDING_MOCK_ENABLED=false
+```
+
+说明：
+
+- `RAG_CASE_CACHE_TOP_K`：告警理解（缓存查找）阶段检索历史成功案例 TopK。
+- `RAG_MESSAGE_TOP_K`：RAG 检索阶段从历史案例库召回 TopK。
+- `RAG_STATIC_TOP_K`：RAG 检索阶段从静态文档库召回 TopK。
+- `RAG_FINAL_TOP_K`：Hybrid RAG 合并和 MMR 后的最终 TopK。
+
+在飞书单卡片流程里，`RAG检索` 会分两块展示：
+
+- 文档/混合召回 Top2
+- 历史案例召回 Top2
+
+这样历史案例不会被静态文档 Top2 挤掉。
+
+## 静态文档切片与入库
+
+Markdown 故障手册使用 `MarkdownHeaderTextSplitter` 按标题层级切片：
+
+```python
+[("#", "h1"), ("##", "h2"), ("###", "h3")]
+```
+
+切片后会补充元数据：
+
+- `doc_id`
+- `section`
+- `alert_category`
+- `severity_level`
+- `error_code`
+- `keywords`
+- `last_updated`
+
+初始化集合和上传静态文档：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\init_milvus_collections.py --static-only
 .\.venv\Scripts\python.exe scripts\ingest_static_docs.py --path data\static_docs
 ```
 
-固定文本默认放在：
+服务器容器内检查静态文档：
 
-```text
-data/static_docs/
+```bash
+docker run --rm --network host \
+  crpi-zzm4e139q0k3kyai.cn-hangzhou.personal.cr.aliyuncs.com/novamate/agentsentinel:rag \
+  python -c "from pymilvus import MilvusClient; c=MilvusClient(uri='http://127.0.0.1:19530'); print(c.query(collection_name='aiops_static_docs', filter='', limit=5, output_fields=['id','title','source','text','metadata']))"
 ```
 
-支持 Markdown 和 JSONL。Markdown 可以使用 frontmatter 描述元数据：
+## 历史案例查询
 
-```markdown
----
-id: runbook-order-sync-timeout
-title: 订单同步超时排查 SOP
-doc_type: runbook
-service: order-sync
-tags:
-  - timeout
----
+按 id 查询历史案例：
 
-# 订单同步超时排查 SOP
-正文内容...
+```bash
+docker run --rm --network host \
+  crpi-zzm4e139q0k3kyai.cn-hangzhou.personal.cr.aliyuncs.com/novamate/agentsentinel:rag \
+  python -c "from pymilvus import MilvusClient; c=MilvusClient(uri='http://127.0.0.1:19530'); print(c.query(collection_name='aiops_message_history', filter='id == \"alert-case-xxx\"', limit=1, output_fields=['id','title','doc_type','service','component','tags','created_at','updated_at','text','metadata']))"
 ```
 
-实时工具现在全部返回 Mock 数据，入口是 `agent_sentinel.tools.mock_tools.fetch_all_live_data()`。内部使用 `asyncio.gather` 并发调用：
+查看集合统计：
 
-- `get_metrics`
-- `query_logs`
-- `get_topology`
+```bash
+docker run --rm --network host \
+  crpi-zzm4e139q0k3kyai.cn-hangzhou.personal.cr.aliyuncs.com/novamate/agentsentinel:rag \
+  python -c "from pymilvus import MilvusClient; c=MilvusClient(uri='http://127.0.0.1:19530'); [print(x, c.get_collection_stats(x)) for x in c.list_collections()]"
+```
 
-每个工具都有 `asyncio.timeout(5)` 和 tenacity 重试。
+## HTTP 诊断接口
+
+```powershell
+curl -X POST http://127.0.0.1:8000/aiops/diagnose ^
+  -H "Content-Type: application/json" ^
+  -H "X-Alert-Token: replace-with-a-strong-token" ^
+  -d "{\"chat_id\":\"\",\"source\":\"alert-bot\",\"level\":\"ERROR\",\"summary\":\"订单同步超时\",\"details\":\"timeout after 3 retries\",\"raw_text\":\"[ALERT] order sync timeout\",\"trigger_type\":\"bot_alert\",\"tags\":[\"prod\",\"order\"]}"
+```
+
+`chat_id` 为空时不会真实发送飞书消息，但会执行 LangGraph 流程。接入飞书群时填入真实 `chat_id`。
 
 ## 旧接口兼容
 
-这些接口仍然保留：
+保留接口：
 
 - `POST /chat/once`
 - `POST /alerts/report`
@@ -313,15 +312,24 @@ tags:
 - `POST /alerts/analyze`
 - `POST /feishu/events`
 
-新增接口：
+新增/核心接口：
 
-- `POST /aiops/diagnose`: 运行 LangGraph 多 Agent 诊断
-- `POST /feishu/card/callback`: 飞书交互卡片回调
+- `POST /aiops/diagnose`
+- `POST /feishu/card/callback`
+- `POST /webhook/card`
 
 ## 测试
 
 ```powershell
-.\.venv\Scripts\pytest.exe
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-`tests/test_workflow.py` 使用 Mock LLM 和禁用人工确认，确保 LangGraph 能编译并执行完整示例流程。
+当前测试覆盖：
+
+- LangGraph 诊断流
+- 飞书事件与卡片回调
+- 单卡片交互式流程
+- RAG MMR
+- Markdown 静态文档切片
+- 历史案例缓存命中与反馈入库
+- Milvus VARCHAR 字段截断
