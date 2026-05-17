@@ -26,6 +26,16 @@ class RetrievedDoc(BaseModel):
         title = self.title or self.id
         service = f" service={self.service}" if self.service else ""
         uri = f" source={self.source_uri}" if self.source_uri else ""
+        if self.source_type == "message_history":
+            plan = self.metadata.get("recommended_plan") or self.metadata.get("final_text") or ""
+            root_cause = self.metadata.get("root_cause") or self.metadata.get("cause") or ""
+            extra = []
+            if root_cause:
+                extra.append(f"历史根因: {root_cause}")
+            if plan:
+                extra.append(f"历史方案: {plan}")
+            suffix = "\n" + "\n".join(extra) if extra else ""
+            return f"[{label}] {title}{service}{uri}\n{self.text}{suffix}"
         return f"[{label}] {title}{service}{uri}\n{self.text}"
 
 

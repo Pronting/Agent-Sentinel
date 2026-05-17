@@ -20,6 +20,8 @@ from agent_sentinel.graph.state import DiagnosisState
 from agent_sentinel.graph.workflow import DiagnosisWorkflow, build_llm_executor
 from agent_sentinel.interactive_topic import InteractiveTopicWorkflow
 from agent_sentinel.interactive_topic.topic_sender import InteractiveTopicSender
+from agent_sentinel.rag.factory import build_retriever
+from agent_sentinel.rag.history_cases import build_history_case_store
 from agent_sentinel.schemas import (
     AlertAnalyzeRequest,
     AlertAnalyzeResponse,
@@ -97,6 +99,8 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                     wait_seconds=settings.interactive_topic_wait_seconds,
                 ),
                 wait_seconds=settings.interactive_topic_wait_seconds,
+                retriever=build_retriever(settings),
+                case_store=build_history_case_store(settings),
             )
         return interactive_topic_workflow
 

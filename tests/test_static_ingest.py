@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from agent_sentinel.rag.embedding import EmbeddingClient
-from agent_sentinel.rag.static_ingest import StaticDocIngestor, load_static_documents
+from agent_sentinel.rag.static_ingest import StaticDocIngestor, load_static_documents, split_and_extract_metadata
 
 
 class FakeMilvus:
@@ -46,6 +46,36 @@ metadata:
     assert docs[0].service == "order-sync"
     assert docs[0].tags == ["timeout"]
     assert docs[0].metadata["owner"] == "sre"
+
+
+def test_split_fault_manual_extracts_metadata(tmp_path) -> None:
+    doc_path = tmp_path / "manual.md"
+    doc_path.write_text(
+        """# 第一章 消息队列全维度故障
+
+## 1.1 消息大规模堆积故障
+
+**故障定义**：核心业务致命故障，MQ 控制台堆积量暴涨，可能返回 503。
+
+### 1. 消费算力不足类
+
+- 消费者实例数少于分区数。
+- 解决方案：扩容消费者并开启批量消费。
+""",
+        encoding="utf-8",
+    )
+
+    docs = split_and_extract_metadata(str(doc_path))
+
+    assert docs
+    metadata = next(doc.metadata for doc in docs if "503" in doc.metadata["error_code"])
+    assert metadata["doc_id"] == "fault_manual_v1"
+    assert metadata["section"].startswith("第一章_消息队列全维度故障_1.1_消息大规模堆积故障")
+    assert metadata["alert_category"] == "MQ"
+    assert metadata["severity_level"] == "P0"
+    assert metadata["error_code"] == ["503"]
+    assert "故障定义" in metadata["keywords"]
+    assert metadata["last_updated"] == "2026-05-17"
 
 
 def test_static_doc_ingestor_builds_records() -> None:

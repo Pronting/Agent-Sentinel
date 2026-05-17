@@ -15,25 +15,33 @@ from langgraph.types import Command, interrupt
 
 from agent_sentinel.interactive_topic.state import TopicFlowState, append_node_result, increment_retry
 from agent_sentinel.interactive_topic.task_store import TopicTaskStore
-from agent_sentinel.interactive_topic.topic_sender import InteractiveTopicSender
+from agent_sentinel.interactive_topic.topic_sender import InteractiveTopicSender, WORKFLOW_STEPS
+from agent_sentinel.rag.base import BaseRetriever
+from agent_sentinel.rag.history_cases import HistoryCaseStore
 
 logger = logging.getLogger(__name__)
 
 NodeRunner = Callable[[TopicFlowState], Awaitable[str]]
+MAX_NODE_RETRIES = 2
+RAG_DISPLAY_TOP_K = 2
 
 
 class InteractiveTopicWorkflow:
-    """Interactive Feishu topic workflow driven by LangGraph interrupts."""
+    """Interactive Feishu workflow using one continuously updated card."""
 
     def __init__(
         self,
         *,
         sender: InteractiveTopicSender,
         wait_seconds: int = 5,
+        retriever: BaseRetriever | None = None,
+        case_store: HistoryCaseStore | None = None,
         checkpointer: Any | None = None,
     ) -> None:
         self.sender = sender
         self.wait_seconds = wait_seconds
+        self.retriever = retriever
+        self.case_store = case_store
         self.task_store = TopicTaskStore(wait_seconds)
         self.checkpointer = checkpointer or InMemorySaver()
         self._compiled: Any | None = None
@@ -99,11 +107,8 @@ class InteractiveTopicWorkflow:
     async def _start_impl(self, chat_id: str, root_message_id: str, query: str) -> str:
         task_id = f"topic-{uuid.uuid4()}"
         self.task_store.create_task(task_id, chat_id, root_message_id, query)
-        await self.sender.send_topic_text(
-            chat_id,
-            root_message_id,
-            f"已创建 LangGraph 交互式话题，任务 ID：{task_id}",
-        )
+        card_message_id = await self.sender.send_workflow_card(chat_id, root_message_id, task_id, query)
+        self.task_store.set_card_message_id(task_id, card_message_id)
         initial_state: TopicFlowState = {
             "query": query,
             "task_id": task_id,
@@ -122,6 +127,8 @@ class InteractiveTopicWorkflow:
         action = str(value.get("action") or value.get("operate") or "")
         if action == "noop":
             return {"status": "ignored"}
+        if action in {"feedback_valid", "feedback_invalid"}:
+            return await self._handle_feedback_callback(task_id, action, source=source)
         if not task_id or not node_name or action not in {"next", "retry"}:
             return {"status": "ignored"}
 
@@ -130,29 +137,26 @@ class InteractiveTopicWorkflow:
             return {"status": "ignored"}
 
         if action == "retry":
-            await self.sender.update_topic_card_status(
+            await self.sender.update_workflow_card(
                 task.card_message_id,
-                task_id,
-                node_name,
-                self._latest_node_result(task_id),
-                "用户已选择重试",
-            )
-            await self.sender.send_topic_text(
-                task.chat_id,
-                task.root_message_id,
-                f"用户拒绝结果，正在重试 {node_name} 节点...",
+                task_id=task_id,
+                query=task.query,
+                node_statuses=self._node_statuses_until(node_name, "failed", self._node_results(task_id)),
+                current_node=node_name,
+                current_result="用户已拒绝当前节点结果，准备重试该节点。",
+                buttons_node=None,
             )
         else:
-            status_text = "超时自动继续" if source == "timeout" else "用户已确认，继续执行"
-            await self.sender.update_topic_card_status(
+            status_text = "超时自动继续" if source == "timeout" else "用户已同意，继续执行"
+            await self.sender.update_workflow_card(
                 task.card_message_id,
-                task_id,
-                node_name,
-                self._latest_node_result(task_id),
-                status_text,
+                task_id=task_id,
+                query=task.query,
+                node_statuses=self._node_statuses_until(node_name, "done", self._node_results(task_id)),
+                current_node=node_name,
+                current_result=status_text,
+                buttons_node=None,
             )
-            if source == "timeout":
-                await self.sender.send_topic_text(task.chat_id, task.root_message_id, "超时未操作，自动继续")
 
         await self._drive(task_id, Command(resume={"action": action, "source": source}))
         return {"status": "ok"}
@@ -163,18 +167,53 @@ class InteractiveTopicWorkflow:
         runner: NodeRunner,
         state: TopicFlowState,
     ) -> TopicFlowState:
-        chat_id = state["chat_id"]
-        root_message_id = state["root_message_id"]
         task_id = state["task_id"]
-        await self.sender.send_topic_text(chat_id, root_message_id, f"正在执行 {node_name} 节点...")
-        node_result = await runner(state)
-        card_message_id = await self.sender.send_topic_card(
-            chat_id,
-            root_message_id,
-            task_id,
-            node_name,
-            node_result,
+        task = self.task_store.get_task(task_id)
+        card_message_id = task.card_message_id if task else None
+        query = state.get("query", "")
+
+        await self.sender.update_workflow_card(
+            card_message_id,
+            task_id=task_id,
+            query=query,
+            node_statuses=self._node_statuses_until(node_name, "running", state.get("node_results", [])),
+            current_node=node_name,
+            current_result=f"正在执行 {_node_title(node_name)} 节点...",
+            buttons_node=None,
         )
+
+        try:
+            node_result = await runner(state)
+        except Exception as exc:
+            logger.exception("Interactive topic node failed task_id=%s node=%s", task_id, node_name)
+            node_result = f"{_node_title(node_name)} 节点执行失败，已跳过当前节点并继续后续流程：{exc}"
+            await self.sender.update_workflow_card(
+                card_message_id,
+                task_id=task_id,
+                query=query,
+                node_statuses=self._node_statuses_until(node_name, "skipped", state.get("node_results", [])),
+                current_node=node_name,
+                current_result=node_result,
+                buttons_node=None,
+            )
+            return {
+                "current_node": node_name,
+                "node_result": node_result,
+                "last_action": "skip",
+                "retry_counts": dict(state.get("retry_counts", {})),
+                "node_results": append_node_result(state, node_name, node_result),
+            }
+
+        await self.sender.update_workflow_card(
+            card_message_id,
+            task_id=task_id,
+            query=query,
+            node_statuses=self._node_statuses_until(node_name, "waiting", state.get("node_results", [])),
+            current_node=node_name,
+            current_result=node_result,
+            buttons_node=node_name,
+        )
+
         self.task_store.mark_waiting(
             task_id,
             node_name,
@@ -194,6 +233,18 @@ class InteractiveTopicWorkflow:
         if action not in {"next", "retry"}:
             action = "next"
         retry_counts = increment_retry(state, node_name) if action == "retry" else dict(state.get("retry_counts", {}))
+        if action == "retry" and retry_counts.get(node_name, 0) >= MAX_NODE_RETRIES:
+            action = "skip"
+            node_result = f"{node_result}\n\n已重试 {MAX_NODE_RETRIES} 次，自动跳过当前节点并进入下一节点。"
+            await self.sender.update_workflow_card(
+                card_message_id,
+                task_id=task_id,
+                query=query,
+                node_statuses=self._node_statuses_until(node_name, "skipped", state.get("node_results", [])),
+                current_node=node_name,
+                current_result=node_result,
+                buttons_node=None,
+            )
         return {
             "current_node": node_name,
             "node_result": node_result,
@@ -216,10 +267,17 @@ class InteractiveTopicWorkflow:
                 task = self.task_store.get_task(task_id)
                 if task is not None:
                     final_text = self._build_final_text(values)
-                    await self.sender.send_topic_text(task.chat_id, task.root_message_id, final_text)
-                self.task_store.finish_task(task_id)
-                async with self._task_locks_guard:
-                    self._task_locks.pop(task_id, None)
+                    await self.sender.update_workflow_card(
+                        task.card_message_id,
+                        task_id=task_id,
+                        query=task.query,
+                        node_statuses={step.node_name: "done" for step in WORKFLOW_STEPS},
+                        current_node=None,
+                        current_result=final_text,
+                        buttons_node=None,
+                        feedback_buttons=True,
+                    )
+                    self.task_store.mark_feedback_waiting(task_id, task.card_message_id)
 
     def _on_timeout(self, task_id: str, node_name: str) -> None:
         try:
@@ -240,15 +298,126 @@ class InteractiveTopicWorkflow:
             return lock
 
     def _route_after_confirm(self, state: TopicFlowState) -> str:
-        return "retry" if state.get("last_action") == "retry" else "next"
+        if state.get("last_action") != "retry":
+            return "next"
+        current_node = str(state.get("current_node") or "")
+        retry_count = state.get("retry_counts", {}).get(current_node, 0)
+        return "retry" if retry_count < MAX_NODE_RETRIES else "next"
 
     async def _cache_check(self, state: TopicFlowState) -> str:
-        await asyncio.sleep(0.1)
-        return f"缓存检查完成：未命中可复用诊断缓存，继续分析用户问题「{state.get('query', '')}」。"
+        query = state.get("query", "")
+        if self.case_store is None:
+            return "缓存检查跳过：历史案例库未配置，请检查 RAG_PROVIDER 和 MILVUS_URI。"
+        docs = await self.case_store.search_similar_cases(query, top_k=RAG_DISPLAY_TOP_K)
+        if not docs:
+            return f"缓存检查完成：未命中可复用诊断缓存，继续分析用户问题「{query}」。"
+
+        lines = [f"缓存检查完成：命中 {len(docs)} 条可复用历史成功案例。"]
+        for index, doc in enumerate(docs, start=1):
+            metadata = doc.metadata or {}
+            plan = metadata.get("recommended_plan") or metadata.get("final_text") or ""
+            plan_text = str(plan).replace("\n", " ")[:220] or "-"
+            lines.append(
+                f"{index}. {doc.title or doc.id} | score={doc.score:.4f}\n"
+                f"   case_id={doc.id}\n"
+                f"   历史方案={plan_text}"
+            )
+        return "\n".join(lines)
 
     async def _rag_retrieve(self, state: TopicFlowState) -> str:
-        await asyncio.sleep(0.1)
-        return "RAG 检索完成：匹配到 3 条相似运维案例，包括连接池耗尽、消息堆积和慢查询放大。"
+        query = state.get("query", "")
+        docs = await self.retriever.retrieve(query) if self.retriever is not None else []
+        history_docs = await self.case_store.search_similar_cases(query, top_k=RAG_DISPLAY_TOP_K) if self.case_store else []
+
+        if not docs and not history_docs:
+            return "RAG 检索完成：真实向量库未命中相关运维片段或历史案例。"
+
+        lines = ["RAG 检索完成："]
+        if docs:
+            display_docs = docs[:RAG_DISPLAY_TOP_K]
+            lines.append(f"\n**文档/混合召回 Top {len(display_docs)} / 共命中 {len(docs)} 条**")
+            for index, doc in enumerate(display_docs, start=1):
+                metadata = doc.metadata or {}
+                section = metadata.get("section") or metadata.get("h2") or metadata.get("h1") or "-"
+                category = metadata.get("alert_category") or "-"
+                severity = metadata.get("severity_level") or "-"
+                source = doc.source_uri or metadata.get("source") or "-"
+                preview = doc.text.replace("\n", " ")[:160]
+                lines.append(
+                    f"{index}. {doc.title or doc.id} | score={doc.score:.4f} | category={category} | "
+                    f"severity={severity}\n   section={section}\n   source={source}\n   {preview}"
+                )
+        else:
+            lines.append("\n**文档/混合召回**：未命中")
+
+        if history_docs:
+            lines.append(f"\n**历史案例召回 Top {len(history_docs)}**")
+            for index, doc in enumerate(history_docs, start=1):
+                metadata = doc.metadata or {}
+                plan = metadata.get("recommended_plan") or metadata.get("final_text") or ""
+                plan_text = str(plan).replace("\n", " ")[:220] or "-"
+                lines.append(
+                    f"{index}. {doc.title or doc.id} | score={doc.score:.4f}\n"
+                    f"   case_id={doc.id}\n"
+                    f"   历史方案={plan_text}"
+                )
+        else:
+            lines.append("\n**历史案例召回**：未命中")
+        return "\n".join(lines)
+
+    async def _handle_feedback_callback(self, task_id: str, action: str, *, source: str) -> dict[str, str]:
+        if not task_id:
+            return {"status": "ignored"}
+        task = self.task_store.confirm_feedback(task_id, action, source=source)
+        if task is None:
+            return {"status": "ignored"}
+
+        app = self.compile()
+        config = {"configurable": {"thread_id": task_id}, "recursion_limit": 50}
+        snapshot = await app.aget_state(config)
+        values = getattr(snapshot, "values", {}) or {}
+        final_text = self._build_final_text(values)
+        saved_case_id = ""
+        if action == "feedback_valid":
+            if self.case_store is not None:
+                try:
+                    saved_case_id = await self.case_store.save_case_to_history(
+                        self._build_feedback_state(task, values, final_text)
+                    )
+                except Exception as exc:
+                    logger.exception("Interactive topic feedback save failed task_id=%s", task_id)
+                    self.task_store.reset_feedback_waiting(task_id)
+                    await self.sender.update_workflow_card(
+                        task.card_message_id,
+                        task_id=task_id,
+                        query=task.query,
+                        node_statuses={step.node_name: "done" for step in WORKFLOW_STEPS},
+                        current_node=None,
+                        current_result=f"{final_text}\n\n❌ 入库失败：{exc}\n请修复后重试，或选择不存储。",
+                        buttons_node=None,
+                        feedback_buttons=True,
+                    )
+                    return {"status": "error", "reason": "save_failed"}
+                result = f"{final_text}\n\n✅ 已存入历史案例知识库：{saved_case_id}"
+            else:
+                result = f"{final_text}\n\n✅ 已确认有效；历史案例库未配置，未执行入库。"
+        else:
+            result = f"{final_text}\n\n❌ 已标记为无效，本次诊断结果不入库。"
+
+        await self.sender.update_workflow_card(
+            task.card_message_id,
+            task_id=task_id,
+            query=task.query,
+            node_statuses={step.node_name: "done" for step in WORKFLOW_STEPS},
+            current_node=None,
+            current_result=result,
+            buttons_node=None,
+            feedback_buttons=False,
+        )
+        self.task_store.finish_task(task_id)
+        async with self._task_locks_guard:
+            self._task_locks.pop(task_id, None)
+        return {"status": "ok", "saved_case_id": saved_case_id}
 
     async def _tool_call(self, state: TopicFlowState) -> str:
         await asyncio.sleep(0.1)
@@ -266,16 +435,60 @@ class InteractiveTopicWorkflow:
                 lines.append(f"- {item.get('node_name')}: {item.get('result')}")
         return "\n".join(lines)
 
-    def _latest_node_result(self, task_id: str) -> str:
+    def _build_feedback_state(self, task: Any, values: dict[str, Any], final_text: str) -> dict[str, Any]:
+        node_results = values.get("node_results", [])
+        result_by_node = {
+            str(item.get("node_name")): str(item.get("result") or "")
+            for item in node_results
+            if isinstance(item, dict)
+        }
+        evidence = [str(item.get("result")) for item in node_results if isinstance(item, dict) and item.get("result")]
+        return {
+            "raw_alert": {
+                "source": "interactive-topic",
+                "summary": task.query,
+                "tags": ["interactive-topic"],
+            },
+            "alert_summary": task.query,
+            "retrieved_docs": [result_by_node.get("rag_retrieve", "")],
+            "live_data": {"tool_call": result_by_node.get("tool_call", "")},
+            "recommended_plan": {"summary": result_by_node.get("summary") or final_text},
+            "evidence": evidence,
+            "validation_result": True,
+            "need_human": False,
+            "human_decision": "feedback_valid",
+            "final_text": final_text,
+            "messages": [{"role": "assistant", "content": final_text}],
+        }
+
+    def _node_results(self, task_id: str) -> list[dict[str, str]]:
         app = self.compile()
         try:
             snapshot = app.get_state({"configurable": {"thread_id": task_id}, "recursion_limit": 50})
             values = getattr(snapshot, "values", {}) or {}
-            result = values.get("node_result")
-            return str(result or "")
+            results = values.get("node_results")
+            return results if isinstance(results, list) else []
         except Exception:
-            logger.debug("Failed to load latest node result task_id=%s", task_id, exc_info=True)
-            return ""
+            logger.debug("Failed to load node results task_id=%s", task_id, exc_info=True)
+            return []
+
+    def _node_statuses_until(
+        self,
+        current_node: str,
+        current_status: str,
+        node_results: list[dict[str, str]],
+    ) -> dict[str, str]:
+        completed = {
+            str(item.get("node_name"))
+            for item in node_results
+            if isinstance(item, dict) and item.get("node_name")
+        }
+        statuses: dict[str, str] = {}
+        for step in WORKFLOW_STEPS:
+            if step.node_name in completed:
+                statuses[step.node_name] = "done"
+        statuses[current_node] = current_status
+        return statuses
 
     def _extract_card_value(self, payload: dict[str, Any]) -> dict[str, Any]:
         action = payload.get("action")
@@ -322,3 +535,10 @@ class InteractiveTopicWorkflow:
         self._loop_started.set()
         logger.info("Interactive topic background event loop started")
         loop.run_forever()
+
+
+def _node_title(node_name: str) -> str:
+    for step in WORKFLOW_STEPS:
+        if step.node_name == node_name:
+            return step.title
+    return node_name

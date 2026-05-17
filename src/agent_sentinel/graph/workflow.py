@@ -10,6 +10,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import Command
 
 from agent_sentinel.agents.fetch_tools import fetch_live_data_node
+from agent_sentinel.agents.feedback_learning import feedback_learning_node
 from agent_sentinel.agents.final_result import final_result_node
 from agent_sentinel.agents.generate_plan import generate_plan_node
 from agent_sentinel.agents.human_confirm import human_confirm_node
@@ -23,6 +24,7 @@ from agent_sentinel.graph.state import DiagnosisState
 from agent_sentinel.llm.executor import LLMExecutor
 from agent_sentinel.rag.base import BaseRetriever
 from agent_sentinel.rag.factory import build_retriever
+from agent_sentinel.rag.history_cases import HistoryCaseStore, build_history_case_store
 from agent_sentinel.utils.config_loader import load_yaml
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ class DiagnosisWorkflow:
         sender: FeishuSender,
         decision_store: HumanDecisionStore,
         retriever: BaseRetriever | None = None,
+        case_store: HistoryCaseStore | None = None,
         checkpointer: Any | None = None,
     ) -> None:
         self.settings = settings
@@ -46,6 +49,7 @@ class DiagnosisWorkflow:
         self.sender = sender
         self.decision_store = decision_store
         self.retriever = retriever or build_retriever(settings)
+        self.case_store = case_store if case_store is not None else build_history_case_store(settings)
         self.checkpointer = checkpointer or InMemorySaver()
         self._compiled: Any | None = None
 
@@ -140,7 +144,16 @@ class DiagnosisWorkflow:
 
     def _node_registry(self) -> dict[str, NodeFn]:
         return {
-            "understand": partial(understand_node, llm=self.llm),
+            "understand": partial(
+                understand_node,
+                llm=self.llm,
+                case_store=self.case_store,
+                sender=self.sender,
+                decision_store=self.decision_store,
+                cache_top_k=self.settings.rag_case_cache_top_k,
+                cache_threshold=self.settings.rag_case_cache_threshold,
+                cache_enabled=self.settings.rag_case_cache_enabled,
+            ),
             "retrieve": partial(retrieve_node, retriever=self.retriever),
             "fetch_live_data": fetch_live_data_node,
             "generate_plan": partial(generate_plan_node, llm=self.llm),
@@ -153,12 +166,20 @@ class DiagnosisWorkflow:
                 enabled=self.settings.aiops_human_confirm_enabled,
             ),
             "final_result": partial(final_result_node, sender=self.sender),
+            "feedback_learning": partial(
+                feedback_learning_node,
+                sender=self.sender,
+                decision_store=self.decision_store,
+                case_store=self.case_store,
+                enabled=self.settings.rag_feedback_enabled,
+            ),
         }
 
     def _route_registry(self) -> dict[str, Callable[[DiagnosisState], str]]:
         return {
             "should_fetch": should_fetch,
             "validation_result": validation_result,
+            "cache_decision": lambda state: "hit" if state.get("cache_hit", False) else "miss",
             "human_decision": lambda state: state.get("human_decision", "timeout"),
             "always": lambda state: "next",
             "end": lambda state: "end",
@@ -166,13 +187,14 @@ class DiagnosisWorkflow:
 
     async def _send_progress(self, node_name: str, state: DiagnosisState) -> None:
         status = {
-            "understand": "✅ 已完成告警理解，正在检索历史案例...",
+            "understand": "✅ 已完成告警理解（缓存查找），正在检索历史案例...",
             "retrieve": "✅ 历史案例检索完成，正在判断是否需要实时数据...",
             "fetch_live_data": "✅ 实时指标、日志、拓扑已获取，正在生成诊断方案...",
             "generate_plan": "✅ 诊断方案已生成，正在进行安全校验...",
             "validate": "✅ 方案校验完成，等待人工确认...",
             "human_confirm": "✅ 人工确认流程结束，正在发送最终结果...",
             "final_result": "✅ 最终诊断结果已发送。",
+            "feedback_learning": "✅ 反馈学习流程结束。",
         }.get(node_name)
         if not status:
             return

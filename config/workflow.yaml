@@ -6,10 +6,14 @@ nodes:
   - name: validate
   - name: human_confirm
   - name: final_result
-edges:
-  - from: understand
-    to: retrieve
+  - name: feedback_learning
+edges: []
 conditional_edges:
+  - from: understand
+    condition: cache_decision
+    mapping:
+      hit: final_result
+      miss: retrieve
   - from: retrieve
     condition: should_fetch
     mapping:
@@ -35,6 +39,10 @@ conditional_edges:
     mapping:
       next: validate
   - from: final_result
+    condition: always
+    mapping:
+      next: feedback_learning
+  - from: feedback_learning
     condition: end
     mapping:
       end: END

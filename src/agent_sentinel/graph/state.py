@@ -25,6 +25,16 @@ class DiagnosisState(TypedDict, total=False):
     human_decision: str
     validation_attempts: int
     final_text: str
+    cache_candidates: list[dict[str, Any]]
+    cache_candidate_index: int
+    cache_decision_id: str
+    cache_decision: str
+    cache_hit: bool
+    cache_selected_case: dict[str, Any]
+    feedback_decision_id: str
+    feedback_card_sent: bool
+    feedback_decision: str
+    saved_case_id: str
 
 
 def append_message(state: DiagnosisState, role: str, content: str) -> list[dict[str, str]]:

@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from agent_sentinel.config import Settings
 from agent_sentinel.feishu_app import FeishuBotClient
+from agent_sentinel.interactive_topic.topic_sender import build_workflow_card
 from agent_sentinel.main import build_app
 
 
@@ -208,7 +209,12 @@ def test_feishu_event_starts_interactive_topic_workflow() -> None:
     settings = make_settings()
     settings.interactive_topic_enabled = True
     settings.feishu_allowed_chat_ids = ["oc_test_chat"]
-    with patch("agent_sentinel.main.InteractiveTopicWorkflow") as workflow_cls:
+    with (
+        patch("agent_sentinel.main.InteractiveTopicWorkflow") as workflow_cls,
+        patch("agent_sentinel.main.build_retriever") as build_retriever,
+    ):
+        retriever = Mock()
+        build_retriever.return_value = retriever
         workflow_cls.return_value.start = AsyncMock(return_value="topic-task-1")
 
         app = build_app(settings)
@@ -246,6 +252,8 @@ def test_feishu_event_starts_interactive_topic_workflow() -> None:
             "om_thread_root",
             "@bot run interactive flow",
         )
+        build_retriever.assert_called_once_with(settings)
+        assert workflow_cls.call_args.kwargs["retriever"] is retriever
 
 
 def test_webhook_card_routes_interactive_topic_callback() -> None:
@@ -263,6 +271,26 @@ def test_webhook_card_routes_interactive_topic_callback() -> None:
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
         workflow_cls.return_value.handle_card_callback.assert_awaited_once_with(payload, source="http")
+
+
+def test_interactive_workflow_card_renders_statuses_and_buttons() -> None:
+    card = build_workflow_card(
+        task_id="topic-1",
+        query="CPU 飙升",
+        node_statuses={"cache_check": "done", "rag_retrieve": "running"},
+        current_node="rag_retrieve",
+        current_result="RAG检索正在执行",
+        wait_seconds=5,
+        buttons_node="rag_retrieve",
+    )
+
+    first_markdown = card["elements"][0]["content"]
+    assert "✅ 已完成 告警理解" in first_markdown
+    assert "🔄 正在执行 RAG检索" in first_markdown
+    assert "⏸ 等待中 实时数据" in first_markdown
+    action = card["elements"][-1]
+    button_texts = [item["text"]["content"] for item in action["actions"]]
+    assert button_texts == ["同意", "拒绝"]
 
 
 def test_feishu_card_callback_resumes_workflow() -> None:

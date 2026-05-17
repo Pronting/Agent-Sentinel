@@ -43,6 +43,15 @@ class TopicTaskStore:
             logger.info("Interactive topic task created task_id=%s chat_id=%s", task_id, chat_id)
             return replace(task, timeout_timer=None)
 
+    def set_card_message_id(self, task_id: str, card_message_id: str | None) -> TopicTask | None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                logger.warning("Cannot set card id for missing interactive topic task task_id=%s", task_id)
+                return None
+            task.card_message_id = card_message_id
+            return replace(task, timeout_timer=None)
+
     def mark_waiting(
         self,
         task_id: str,
@@ -115,6 +124,51 @@ class TopicTaskStore:
                 normalized_action,
                 source,
             )
+            return replace(task, timeout_timer=None)
+
+    def mark_feedback_waiting(self, task_id: str, card_message_id: str | None) -> TopicTask | None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                logger.warning("Cannot mark missing interactive topic task feedback task_id=%s", task_id)
+                return None
+            self._cancel_timer_locked(task)
+            task.status = "pending_feedback"
+            task.current_node = "feedback_learning"
+            task.card_message_id = card_message_id
+            task.last_action = None
+            logger.info("Interactive topic task waiting for feedback task_id=%s", task_id)
+            return replace(task, timeout_timer=None)
+
+    def confirm_feedback(self, task_id: str, action: str, *, source: str) -> TopicTask | None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                logger.info("Ignoring feedback for missing interactive topic task task_id=%s", task_id)
+                return None
+            if task.status != "pending_feedback" or task.current_node != "feedback_learning":
+                logger.info(
+                    "Ignoring duplicate interactive topic feedback task_id=%s action=%s status=%s source=%s",
+                    task_id,
+                    action,
+                    task.status,
+                    source,
+                )
+                return None
+            task.status = "feedback_received"
+            task.last_action = action
+            logger.info("Interactive topic feedback accepted task_id=%s action=%s source=%s", task_id, action, source)
+            return replace(task, timeout_timer=None)
+
+    def reset_feedback_waiting(self, task_id: str) -> TopicTask | None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            task.status = "pending_feedback"
+            task.current_node = "feedback_learning"
+            task.last_action = None
+            logger.info("Interactive topic feedback reset to pending task_id=%s", task_id)
             return replace(task, timeout_timer=None)
 
     def get_task(self, task_id: str) -> TopicTask | None:

@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from agent_sentinel.config import Settings
+from agent_sentinel.graph.state import DiagnosisState
+from agent_sentinel.rag.embedding import EmbeddingClient
+from agent_sentinel.rag.milvus_client import MilvusSearchConfig, MilvusVectorClient
+from agent_sentinel.rag.models import RetrievedDoc
+
+
+@dataclass(slots=True)
+class HistoryCaseStore:
+    milvus: MilvusVectorClient
+    embedding: EmbeddingClient
+    collection_name: str
+    similarity_threshold: float = 0.85
+
+    async def search_similar_cases(
+        self,
+        alert_text: str,
+        *,
+        top_k: int = 2,
+        threshold: float | None = None,
+    ) -> list[RetrievedDoc]:
+        if not alert_text.strip():
+            return []
+        query_embedding = await self.embedding.embed(alert_text)
+        docs = await self.milvus.search(
+            collection_name=self.collection_name,
+            query_embedding=query_embedding,
+            top_k=top_k,
+            source_type="message_history",
+            expr='doc_type == "alert_case"',
+        )
+        min_score = self.similarity_threshold if threshold is None else threshold
+        return [doc for doc in docs if doc.score >= min_score]
+
+    async def save_case_to_history(self, state: DiagnosisState) -> str:
+        alert_text = build_alert_text(state.get("raw_alert", {}))
+        if not alert_text.strip():
+            alert_text = str(state.get("alert_summary") or "AIOps alert case")
+        alert_text = _truncate_utf8(alert_text, 65535)
+        embedding = await self.embedding.embed(alert_text)
+        now = int(time.time())
+        raw_alert = state.get("raw_alert", {})
+        metadata = {
+            "alert_summary": state.get("alert_summary", ""),
+            "retrieved_docs": state.get("retrieved_docs", []),
+            "live_data": state.get("live_data", {}),
+            "recommended_plan": state.get("recommended_plan", {}),
+            "evidence": state.get("evidence", []),
+            "validation_result": state.get("validation_result", False),
+            "need_human": state.get("need_human", False),
+            "human_decision": state.get("human_decision", ""),
+            "final_text": state.get("final_text", ""),
+            "full_workflow_log": state.get("messages", []),
+        }
+        title = _truncate_utf8(str(raw_alert.get("summary") or state.get("alert_summary") or "AIOps alert case"), 512)
+        tags = _extract_tags(state)
+        case_id = f"alert-case-{hashlib.sha256(f'{alert_text}:{now}'.encode('utf-8')).hexdigest()[:24]}"
+        record = {
+            "id": case_id,
+            "text": alert_text,
+            "embedding": embedding,
+            "doc_type": "alert_case",
+            "title": title,
+            "service": _truncate_utf8(str(raw_alert.get("service") or raw_alert.get("source") or ""), 128),
+            "component": _truncate_utf8(str(raw_alert.get("component") or ""), 128),
+            "tags": _truncate_utf8(",".join(tags), 1024),
+            "version": "v1",
+            "updated_at": now,
+            "created_at": now,
+            "source_uri": _truncate_utf8(str(raw_alert.get("source_uri") or ""), 1024),
+            "source": _truncate_utf8(str(raw_alert.get("source") or "aiops"), 1024),
+            "metadata": _metadata_json(metadata),
+        }
+        await self.milvus.ensure_static_doc_collection(self.collection_name, len(embedding))
+        await self.milvus.upsert(self.collection_name, [record])
+        return case_id
+
+
+def build_history_case_store(settings: Settings) -> HistoryCaseStore | None:
+    if settings.rag_provider.strip().lower() != "milvus" or not settings.milvus_uri:
+        return None
+    milvus = MilvusVectorClient(
+        MilvusSearchConfig(
+            uri=settings.milvus_uri,
+            token=settings.milvus_token,
+            user=settings.milvus_user,
+            password=settings.milvus_password,
+            db_name=settings.milvus_db_name,
+        )
+    )
+    embedding = EmbeddingClient(
+        api_key=settings.embedding_api_key or "",
+        base_url=settings.embedding_base_url,
+        model=settings.embedding_model,
+        dimension=settings.embedding_dimension,
+        mock_enabled=settings.embedding_mock_enabled,
+    )
+    return HistoryCaseStore(
+        milvus=milvus,
+        embedding=embedding,
+        collection_name=settings.rag_message_collection,
+        similarity_threshold=settings.rag_case_cache_threshold,
+    )
+
+
+def build_alert_text(raw_alert: dict[str, Any]) -> str:
+    parts = [
+        str(raw_alert.get("summary") or ""),
+        str(raw_alert.get("details") or ""),
+        str(raw_alert.get("raw_text") or ""),
+    ]
+    if not any(part.strip() for part in parts):
+        parts.append(json.dumps(raw_alert, ensure_ascii=False, sort_keys=True))
+    return "\n".join(part for part in parts if part.strip())
+
+
+def final_plan_from_case(doc: RetrievedDoc) -> dict[str, Any]:
+    metadata = doc.metadata or {}
+    plan = metadata.get("recommended_plan") or metadata.get("final_plan") or metadata.get("final_result")
+    if isinstance(plan, dict):
+        return plan
+    if isinstance(plan, str) and plan.strip():
+        return {"summary": plan}
+    final_text = metadata.get("final_text")
+    if isinstance(final_text, str) and final_text.strip():
+        return {"summary": final_text}
+    return {"summary": doc.text[:1200]}
+
+
+def case_to_dict(doc: RetrievedDoc) -> dict[str, Any]:
+    return {
+        "id": doc.id,
+        "title": doc.title or "",
+        "text": doc.text,
+        "score": doc.score,
+        "source_uri": doc.source_uri or "",
+        "metadata": doc.metadata,
+        "final_plan": final_plan_from_case(doc),
+    }
+
+
+def _extract_tags(state: DiagnosisState) -> list[str]:
+    raw_alert = state.get("raw_alert", {})
+    tags = [str(tag).strip() for tag in raw_alert.get("tags", []) if str(tag).strip()]
+    for item in state.get("evidence", []):
+        for token in ("MQ", "CPU", "Redis", "MySQL", "JVM", "超时", "堆积", "死锁"):
+            if token in item and token not in tags:
+                tags.append(token)
+    return tags[:10]
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    data = value.encode("utf-8")
+    if len(data) <= max_bytes:
+        return value
+    return data[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _metadata_json(metadata: dict[str, Any]) -> str:
+    raw = json.dumps(metadata, ensure_ascii=False)
+    if len(raw.encode("utf-8")) <= 8192:
+        return raw
+
+    compact = {
+        "alert_summary": _truncate_utf8(str(metadata.get("alert_summary") or ""), 700),
+        "retrieved_docs": [
+            _truncate_utf8(str(item), 900)
+            for item in list(metadata.get("retrieved_docs") or [])[:2]
+        ],
+        "live_data": metadata.get("live_data", {}),
+        "recommended_plan": metadata.get("recommended_plan", {}),
+        "evidence": [
+            _truncate_utf8(str(item), 500)
+            for item in list(metadata.get("evidence") or [])[:8]
+        ],
+        "validation_result": metadata.get("validation_result", False),
+        "need_human": metadata.get("need_human", False),
+        "human_decision": metadata.get("human_decision", ""),
+        "final_text": _truncate_utf8(str(metadata.get("final_text") or ""), 1800),
+        "full_workflow_log": "truncated",
+    }
+    raw = json.dumps(compact, ensure_ascii=False)
+    if len(raw.encode("utf-8")) <= 8192:
+        return raw
+    return json.dumps(
+        {"truncated": _truncate_utf8(raw, 7800)},
+        ensure_ascii=False,
+    )

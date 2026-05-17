@@ -79,17 +79,21 @@ class Settings:
     aiops_human_confirm_enabled: bool = True
     redis_url: str | None = None
     rag_provider: str = "mock"
-    rag_final_top_k: int = 6
+    rag_final_top_k: int = 2
     rag_mmr_lambda: float = 0.55
     rag_static_enabled: bool = True
     rag_static_collection: str = "aiops_static_docs"
-    rag_static_top_k: int = 8
+    rag_static_top_k: int = 2
     rag_static_weight: float = 0.55
     rag_message_enabled: bool = True
     rag_message_collection: str = "aiops_message_history"
-    rag_message_top_k: int = 12
+    rag_message_top_k: int = 2
     rag_message_weight: float = 0.45
     rag_message_default_days: int = 30
+    rag_case_cache_enabled: bool = True
+    rag_case_cache_threshold: float = 0.85
+    rag_case_cache_top_k: int = 2
+    rag_feedback_enabled: bool = True
     milvus_uri: str | None = None
     milvus_token: str | None = None
     milvus_user: str | None = None
@@ -195,7 +199,7 @@ def get_settings() -> Settings:
         ),
         redis_url=os.getenv("REDIS_URL", str(redis_cfg.get("url", "")) or None),
         rag_provider=os.getenv("RAG_PROVIDER", str(rag_cfg.get("provider", "mock"))),
-        rag_final_top_k=_to_int(os.getenv("RAG_FINAL_TOP_K"), int(rag_cfg.get("final_top_k", 6))),
+        rag_final_top_k=_to_int(os.getenv("RAG_FINAL_TOP_K"), int(rag_cfg.get("final_top_k", 2))),
         rag_mmr_lambda=_to_float(os.getenv("RAG_MMR_LAMBDA"), float(rag_cfg.get("mmr_lambda", 0.55))),
         rag_static_enabled=_to_bool(
             os.getenv("RAG_STATIC_ENABLED"),
@@ -205,7 +209,7 @@ def get_settings() -> Settings:
             "RAG_STATIC_COLLECTION",
             str(static_cfg.get("collection", "aiops_static_docs")),
         ),
-        rag_static_top_k=_to_int(os.getenv("RAG_STATIC_TOP_K"), int(static_cfg.get("top_k", 8))),
+        rag_static_top_k=_to_int(os.getenv("RAG_STATIC_TOP_K"), int(static_cfg.get("top_k", 2))),
         rag_static_weight=_to_float(os.getenv("RAG_STATIC_WEIGHT"), float(static_cfg.get("weight", 0.55))),
         rag_message_enabled=_to_bool(
             os.getenv("RAG_MESSAGE_ENABLED"),
@@ -215,11 +219,27 @@ def get_settings() -> Settings:
             "RAG_MESSAGE_COLLECTION",
             str(message_cfg.get("collection", "aiops_message_history")),
         ),
-        rag_message_top_k=_to_int(os.getenv("RAG_MESSAGE_TOP_K"), int(message_cfg.get("top_k", 12))),
+        rag_message_top_k=_to_int(os.getenv("RAG_MESSAGE_TOP_K"), int(message_cfg.get("top_k", 2))),
         rag_message_weight=_to_float(os.getenv("RAG_MESSAGE_WEIGHT"), float(message_cfg.get("weight", 0.45))),
         rag_message_default_days=_to_int(
             os.getenv("RAG_MESSAGE_DEFAULT_DAYS"),
             int(message_cfg.get("default_days", 30)),
+        ),
+        rag_case_cache_enabled=_to_bool(
+            os.getenv("RAG_CASE_CACHE_ENABLED"),
+            bool(message_cfg.get("case_cache_enabled", True)),
+        ),
+        rag_case_cache_threshold=_to_float(
+            os.getenv("RAG_CASE_CACHE_THRESHOLD"),
+            float(message_cfg.get("case_cache_threshold", 0.85)),
+        ),
+        rag_case_cache_top_k=_to_int(
+            os.getenv("RAG_CASE_CACHE_TOP_K"),
+            int(message_cfg.get("case_cache_top_k", 2)),
+        ),
+        rag_feedback_enabled=_to_bool(
+            os.getenv("RAG_FEEDBACK_ENABLED"),
+            bool(message_cfg.get("feedback_enabled", True)),
         ),
         milvus_uri=os.getenv("MILVUS_URI"),
         milvus_token=os.getenv("MILVUS_TOKEN"),

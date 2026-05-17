@@ -92,8 +92,39 @@ class MilvusVectorClient:
                 timeout=self.config.timeout_seconds,
             )
         except Exception:
-            logger.exception("Milvus search failed collection=%s", collection_name)
-            return []
+            fallback_fields = [
+                "id",
+                "text",
+                "source",
+                "service",
+                "tags",
+                "created_at",
+                "metadata",
+                "title",
+                "source_uri",
+                "embedding",
+            ]
+            if output_fields is not None or fields == fallback_fields:
+                logger.exception("Milvus search failed collection=%s", collection_name)
+                return []
+            logger.warning(
+                "Milvus search failed with default output fields; retrying with schema-safe fields collection=%s",
+                collection_name,
+            )
+            try:
+                results = client.search(
+                    collection_name=collection_name,
+                    data=[query_embedding],
+                    anns_field="embedding",
+                    limit=top_k,
+                    filter=expr,
+                    output_fields=fallback_fields,
+                    search_params={"metric_type": "COSINE", "params": {}},
+                    timeout=self.config.timeout_seconds,
+                )
+            except Exception:
+                logger.exception("Milvus search fallback failed collection=%s", collection_name)
+                return []
 
         docs: list[RetrievedDoc] = []
         for hit in results[0] if results else []:

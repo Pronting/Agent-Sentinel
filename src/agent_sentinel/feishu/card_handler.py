@@ -84,12 +84,18 @@ class FeishuCardHandler:
 
     async def parse_callback(self, payload: dict[str, Any]) -> DecisionContext | None:
         value = self._extract_value(payload)
-        if value.get("action") != "diagnosis_confirm":
+        action = str(value.get("action") or "")
+        allowed_decisions = {
+            "diagnosis_confirm": {"approved", "rejected"},
+            "case_cache_decision": {"adopt", "reject"},
+            "case_feedback": {"valid", "invalid"},
+        }
+        if action not in allowed_decisions:
             return None
         decision_id = str(value.get("decision_id") or "")
         decision = str(value.get("decision") or "")
         feedback = str(value.get("feedback") or payload.get("feedback") or "")
-        if not decision_id or decision not in {"approved", "rejected"}:
+        if not decision_id or decision not in allowed_decisions[action]:
             return None
         return await self.decision_store.mark_decision_received(decision_id, decision, feedback)
 

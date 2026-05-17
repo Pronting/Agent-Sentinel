@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
 import time
 
+import aiohttp
 import requests
 
 from agent_sentinel.config import Settings
@@ -182,6 +184,28 @@ class FeishuBotClient:
         result = response.json()
         if result.get("code") not in (0, "0", None):
             raise RuntimeError(f"Feishu update message card failed: {result}")
+        return True
+
+    async def update_message_card_async(self, message_id: str, card: dict[str, object]) -> bool:
+        """Async PATCH update for a bot-sent interactive card."""
+        self._ensure_configured()
+        token = await asyncio.to_thread(self._get_tenant_access_token)
+        url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages/{message_id}"
+        payload = {"content": json.dumps(card, ensure_ascii=False)}
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.patch(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+        if result.get("code") not in (0, "0", None):
+            raise RuntimeError(f"Feishu async update message card failed: {result}")
         return True
 
     def list_chat_messages(

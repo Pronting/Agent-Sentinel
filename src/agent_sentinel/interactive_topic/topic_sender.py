@@ -2,30 +2,127 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from agent_sentinel.feishu_app import FeishuBotClient
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowStep:
+    node_name: str
+    title: str
+
+
+WORKFLOW_STEPS: tuple[WorkflowStep, ...] = (
+    WorkflowStep("cache_check", "告警理解（缓存查找）"),
+    WorkflowStep("rag_retrieve", "RAG检索"),
+    WorkflowStep("tool_call", "实时数据"),
+    WorkflowStep("summary", "方案生成"),
+)
+
+STATUS_TEXT = {
+    "done": "✅ 已完成",
+    "running": "🔄 正在执行",
+    "waiting": "⏸ 等待确认",
+    "skipped": "⏭ 已跳过",
+    "failed": "❌ 失败",
+    "pending": "⏸ 等待中",
+}
+
+
 class InteractiveTopicSender:
-    """Send text and confirmation cards into a Feishu message thread."""
+    """Send and update a single Feishu card for an interactive workflow."""
 
     def __init__(self, client: FeishuBotClient | None, wait_seconds: int = 5) -> None:
         self.client = client
         self.wait_seconds = wait_seconds
+        self._update_locks: dict[str, asyncio.Lock] = {}
+        self._update_locks_guard = asyncio.Lock()
 
+    async def send_workflow_card(
+        self,
+        chat_id: str,
+        root_message_id: str,
+        task_id: str,
+        query: str,
+    ) -> str | None:
+        if not self.client or not self.client.is_configured():
+            logger.info("Interactive workflow card skipped chat_id=%s task_id=%s", chat_id, task_id)
+            return None
+        card = build_workflow_card(
+            task_id=task_id,
+            query=query,
+            node_statuses={},
+            current_result="工作流已创建，等待开始执行。",
+            current_node=None,
+            wait_seconds=self.wait_seconds,
+            buttons_node=None,
+            feedback_buttons=False,
+        )
+        try:
+            return await asyncio.to_thread(
+                self.client.send_topic_card,
+                chat_id,
+                root_message_id,
+                card,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send interactive workflow card chat_id=%s root=%s task_id=%s",
+                chat_id,
+                root_message_id,
+                task_id,
+            )
+            return None
+
+    async def update_workflow_card(
+        self,
+        message_id: str | None,
+        *,
+        task_id: str,
+        query: str,
+        node_statuses: dict[str, str],
+        current_result: str,
+        current_node: str | None = None,
+        buttons_node: str | None = None,
+        feedback_buttons: bool = False,
+    ) -> bool:
+        if not message_id or not self.client or not self.client.is_configured():
+            logger.info(
+                "Interactive workflow card update skipped task_id=%s current_node=%s result=%s",
+                task_id,
+                current_node,
+                current_result,
+            )
+            return False
+
+        card = build_workflow_card(
+            task_id=task_id,
+            query=query,
+            node_statuses=node_statuses,
+            current_result=current_result,
+            current_node=current_node,
+            wait_seconds=self.wait_seconds,
+            buttons_node=buttons_node,
+            feedback_buttons=feedback_buttons,
+        )
+        lock = await self._get_update_lock(message_id)
+        async with lock:
+            try:
+                return await self.client.update_message_card_async(message_id, card)
+            except Exception:
+                logger.exception("Failed to update interactive workflow card message_id=%s", message_id)
+                return False
+
+    # Backward-compatible wrappers kept for older call sites/tests.
     async def send_topic_text(self, chat_id: str, root_message_id: str, text: str) -> str | None:
         if not self.client or not self.client.is_configured():
             logger.info("Interactive topic text skipped chat_id=%s text=%s", chat_id, text)
             return None
         try:
-            return await asyncio.to_thread(
-                self.client.send_topic_text,
-                chat_id,
-                root_message_id,
-                text,
-            )
+            return await asyncio.to_thread(self.client.send_topic_text, chat_id, root_message_id, text)
         except Exception:
             logger.exception("Failed to send interactive topic text chat_id=%s root=%s", chat_id, root_message_id)
             return None
@@ -38,33 +135,7 @@ class InteractiveTopicSender:
         node_name: str,
         node_result: str,
     ) -> str | None:
-        if not self.client or not self.client.is_configured():
-            logger.info("Interactive topic card skipped chat_id=%s task_id=%s node=%s", chat_id, task_id, node_name)
-            return None
-        card = build_topic_confirm_card(
-            task_id=task_id,
-            node_name=node_name,
-            node_result=node_result,
-            wait_seconds=self.wait_seconds,
-            status_text="等待确认",
-            buttons_enabled=True,
-        )
-        try:
-            return await asyncio.to_thread(
-                self.client.send_topic_card,
-                chat_id,
-                root_message_id,
-                card,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to send interactive topic card chat_id=%s root=%s task_id=%s node=%s",
-                chat_id,
-                root_message_id,
-                task_id,
-                node_name,
-            )
-            return None
+        return await self.send_workflow_card(chat_id, root_message_id, task_id, node_result)
 
     async def update_topic_card_status(
         self,
@@ -74,75 +145,159 @@ class InteractiveTopicSender:
         node_result: str,
         status_text: str,
     ) -> bool:
-        if not message_id or not self.client or not self.client.is_configured():
-            return False
-        card = build_topic_confirm_card(
+        return await self.update_workflow_card(
+            message_id,
             task_id=task_id,
-            node_name=node_name,
-            node_result=node_result,
-            wait_seconds=self.wait_seconds,
-            status_text=status_text,
-            buttons_enabled=False,
+            query="",
+            node_statuses={node_name: "done"},
+            current_node=node_name,
+            current_result=status_text or node_result,
+            buttons_node=None,
+            feedback_buttons=False,
         )
-        try:
-            return await asyncio.to_thread(self.client.update_message_card, message_id, card)
-        except Exception:
-            logger.exception("Failed to update interactive topic card message_id=%s", message_id)
-            return False
+
+    async def _get_update_lock(self, message_id: str) -> asyncio.Lock:
+        async with self._update_locks_guard:
+            lock = self._update_locks.get(message_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._update_locks[message_id] = lock
+            return lock
 
 
-def build_topic_confirm_card(
+def build_workflow_card(
     *,
     task_id: str,
-    node_name: str,
-    node_result: str,
+    query: str,
+    node_statuses: dict[str, str],
+    current_result: str,
+    current_node: str | None,
     wait_seconds: int,
-    status_text: str,
-    buttons_enabled: bool,
+    buttons_node: str | None,
+    feedback_buttons: bool = False,
 ) -> dict[str, object]:
-    actions: list[dict[str, object]] = []
-    if buttons_enabled:
-        actions = [
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "Yes 下一步"},
-                "type": "primary",
-                "value": {"task_id": task_id, "node_name": node_name, "action": "next"},
-            },
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "No 重试节点"},
-                "type": "danger",
-                "value": {"task_id": task_id, "node_name": node_name, "action": "retry"},
-            },
-        ]
-    else:
-        actions = [
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": status_text},
-                "type": "default",
-                "disabled": True,
-                "value": {"task_id": task_id, "node_name": node_name, "action": "noop"},
-            }
-        ]
+    steps = []
+    for index, step in enumerate(WORKFLOW_STEPS, start=1):
+        status = node_statuses.get(step.node_name, "pending")
+        steps.append(f"{index}. {STATUS_TEXT.get(status, STATUS_TEXT['pending'])} {step.title}")
+
+    elements: list[dict[str, object]] = [
+        {
+            "tag": "markdown",
+            "content": "\n".join(steps),
+        },
+        {"tag": "hr"},
+        {
+            "tag": "markdown",
+            "content": (
+                f"**任务 ID**：{task_id}\n"
+                f"**用户问题**：{_truncate(query or '-', 500)}\n"
+                f"**当前节点**：{_step_title(current_node) if current_node else '-'}\n\n"
+                f"**当前节点结果**：\n{_truncate(current_result or '-', 1800)}"
+            ),
+        },
+    ]
+
+    if buttons_node:
+        elements.extend(
+            [
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": f"请确认当前节点结果；{wait_seconds} 秒无操作将按现有逻辑自动继续。",
+                        }
+                    ],
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "同意"},
+                            "type": "primary",
+                            "value": {"task_id": task_id, "node_name": buttons_node, "action": "next"},
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "拒绝"},
+                            "type": "danger",
+                            "value": {"task_id": task_id, "node_name": buttons_node, "action": "retry"},
+                        },
+                    ],
+                },
+            ]
+        )
+
+    if feedback_buttons:
+        elements.extend(
+            [
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": "请判断当前诊断结果是否有效；有效后会写入历史案例知识库。",
+                        }
+                    ],
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "✅ 有效，存入知识库"},
+                            "type": "primary",
+                            "value": {
+                                "task_id": task_id,
+                                "node_name": "feedback_learning",
+                                "action": "feedback_valid",
+                            },
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "❌ 无效，不存储"},
+                            "type": "danger",
+                            "value": {
+                                "task_id": task_id,
+                                "node_name": "feedback_learning",
+                                "action": "feedback_invalid",
+                            },
+                        },
+                    ],
+                },
+            ]
+        )
 
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
-            "template": "blue",
-            "title": {"tag": "plain_text", "content": "LangGraph 节点确认"},
+            "template": _header_template(node_statuses),
+            "title": {"tag": "plain_text", "content": "智能诊断工作流"},
         },
-        "elements": [
-            {
-                "tag": "markdown",
-                "content": (
-                    f"**当前节点：{node_name}**\n\n"
-                    f"{node_result}\n\n"
-                    f"**状态：{status_text}**\n\n"
-                    f"{wait_seconds} 秒无操作自动进入下一步"
-                ),
-            },
-            {"tag": "action", "actions": actions},
-        ],
+        "elements": elements,
     }
+
+
+def _step_title(node_name: str | None) -> str:
+    for step in WORKFLOW_STEPS:
+        if step.node_name == node_name:
+            return step.title
+    return node_name or "-"
+
+
+def _header_template(node_statuses: dict[str, str]) -> str:
+    if any(status == "failed" for status in node_statuses.values()):
+        return "red"
+    if all(node_statuses.get(step.node_name) == "done" for step in WORKFLOW_STEPS):
+        return "green"
+    if any(status == "running" for status in node_statuses.values()):
+        return "blue"
+    return "wathet"
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."

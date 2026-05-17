@@ -29,19 +29,23 @@ redis:
 
 rag:
   provider: mock
-  final_top_k: 6
+  final_top_k: 2
   mmr_lambda: 0.55
   static_docs:
     enabled: true
     collection: aiops_static_docs
-    top_k: 8
+    top_k: 2
     weight: 0.55
   message_history:
     enabled: true
     collection: aiops_message_history
-    top_k: 12
+    top_k: 2
     weight: 0.45
     default_days: 30
+    case_cache_enabled: true
+    case_cache_threshold: 0.85
+    case_cache_top_k: 2
+    feedback_enabled: true
 
 embedding:
   model: text-embedding-3-small

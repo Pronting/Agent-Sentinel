@@ -3,18 +3,55 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
 from agent_sentinel.rag.embedding import EmbeddingClient
 from agent_sentinel.rag.milvus_client import MilvusVectorClient
 
 logger = logging.getLogger(__name__)
+
+try:  # LangChain 0.x compatibility.
+    from langchain.text_splitter import MarkdownHeaderTextSplitter
+except ModuleNotFoundError:  # LangChain 1.x splitters live in a companion package.
+    from langchain_text_splitters import MarkdownHeaderTextSplitter
+
+
+MANUAL_DOC_ID = "fault_manual_v1"
+MANUAL_LAST_UPDATED = "2026-05-17"
+ERROR_CODE_PATTERN = re.compile(
+    r"\b(429|500|503|504|Too many connections|Metaspace OOM|OutOfMemoryError|Connection pool exhausted)\b",
+    re.IGNORECASE,
+)
+STOPWORDS = {
+    "故障",
+    "现象",
+    "根因",
+    "解决方案",
+    "排查",
+    "处理",
+    "方案",
+    "定义",
+    "详细",
+    "标准",
+    "业务",
+    "系统",
+    "导致",
+    "出现",
+    "查看",
+    "检查",
+    "进行",
+    "如果",
+    "所有",
+}
 
 
 class StaticDocument(BaseModel):
@@ -99,10 +136,88 @@ def load_static_documents(path: str | Path) -> list[StaticDocument]:
 def _load_file(path: Path) -> list[StaticDocument]:
     suffix = path.suffix.lower()
     if suffix in {".md", ".markdown"}:
-        return [_load_markdown(path)]
+        return _load_markdown_chunks(path)
     if suffix == ".jsonl":
         return _load_jsonl(path)
     return []
+
+
+def split_and_extract_metadata(file_path: str) -> list[Document]:
+    """Split a Markdown fault manual by heading hierarchy and enrich RAG metadata.
+
+    The returned Documents can be embedded and upserted into vector stores such as
+    Milvus; keep page_content as the chunk text and persist metadata alongside it.
+    """
+
+    path = Path(file_path)
+    raw = path.read_text(encoding="utf-8")
+    frontmatter, body = _split_frontmatter(raw)
+    splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3")],
+        strip_headers=False,
+    )
+    chunks = splitter.split_text(body)
+
+    documents: list[Document] = []
+    for index, chunk in enumerate(chunks, start=1):
+        metadata = {
+            **_to_dict(frontmatter.get("metadata")),
+            **{key: value for key, value in frontmatter.items() if key != "metadata"},
+            **chunk.metadata,
+        }
+        h1 = str(metadata.get("h1") or "")
+        h2 = str(metadata.get("h2") or "")
+        h3 = str(metadata.get("h3") or "")
+        page_content = chunk.page_content.strip()
+        metadata.update(
+            {
+                "doc_id": MANUAL_DOC_ID,
+                "chunk_index": index,
+                "section": _build_section(h1, h2, h3),
+                "alert_category": _detect_alert_category(h1),
+                "severity_level": _detect_severity(page_content),
+                "error_code": _extract_error_codes(page_content),
+                "keywords": _extract_keywords(page_content),
+                "last_updated": MANUAL_LAST_UPDATED,
+                "source": path.as_posix(),
+                "file_path": str(path),
+            }
+        )
+        documents.append(Document(page_content=page_content, metadata=metadata))
+    return documents
+
+
+def _load_markdown_chunks(path: Path) -> list[StaticDocument]:
+    docs = split_and_extract_metadata(str(path))
+    if not docs:
+        return []
+    raw = path.read_text(encoding="utf-8")
+    frontmatter, body = _split_frontmatter(raw)
+    base_id = str(frontmatter.get("id") or (MANUAL_DOC_ID if path.name == "线上全场景故障排查终极手册（企业级超详细完整版）.md" else path.stem))
+    title = str(frontmatter.get("title") or _extract_markdown_title(body) or path.stem)
+    updated_at = _to_int(frontmatter.get("updated_at"), 0)
+    tags = _to_tags(frontmatter.get("tags"))
+    static_docs: list[StaticDocument] = []
+    for index, doc in enumerate(docs, start=1):
+        metadata = dict(doc.metadata)
+        chunk_id = base_id if index == 1 else f"{base_id}-{index:04d}"
+        chunk_title = str(metadata.get("h3") or metadata.get("h2") or metadata.get("h1") or title)
+        static_docs.append(
+            StaticDocument(
+                id=chunk_id,
+                text=doc.page_content,
+                doc_type=str(frontmatter.get("doc_type") or "runbook"),
+                title=chunk_title,
+                service=str(frontmatter.get("service") or "global"),
+                component=str(frontmatter.get("component") or metadata.get("alert_category") or ""),
+                tags=tags,
+                version=str(frontmatter.get("version") or "v1"),
+                updated_at=updated_at,
+                source_uri=str(frontmatter.get("source_uri") or path.as_posix()),
+                metadata=metadata,
+            )
+        )
+    return static_docs
 
 
 def _load_markdown(path: Path) -> StaticDocument:
@@ -164,6 +279,91 @@ def _extract_markdown_title(text: str) -> str | None:
     return None
 
 
+def _build_section(h1: str, h2: str, h3: str) -> str:
+    return "_".join(_normalize_section_part(part) for part in (h1, h2, h3) if part.strip())
+
+
+def _normalize_section_part(value: str) -> str:
+    value = value.replace(r"\.", ".").strip()
+    value = re.sub(r"^#+\s*", "", value)
+    value = re.sub(r"\s+", "_", value)
+    return value.strip("_")
+
+
+def _detect_alert_category(h1: str) -> str:
+    mapping = (
+        ("消息队列", "MQ"),
+        ("应用服务", "应用服务"),
+        ("JVM", "JVM"),
+        ("MySQL", "MySQL"),
+        ("Redis", "Redis"),
+        ("网络、网关、注册中心", "网络/网关"),
+        ("容器K8s", "K8s"),
+        ("日志、监控、告警", "日志监控"),
+        ("业务逻辑", "业务逻辑"),
+    )
+    for needle, category in mapping:
+        if needle in h1:
+            return category
+    return "其他"
+
+
+def _detect_severity(page_content: str) -> str:
+    if any(token in page_content for token in ("核心业务致命故障", "高危", "雪崩")):
+        return "P0"
+    if any(token in page_content for token in ("严重", "暴涨", "飙升")):
+        return "P1"
+    return "P2"
+
+
+def _extract_error_codes(page_content: str) -> list[str]:
+    seen: set[str] = set()
+    values: list[str] = []
+    for match in ERROR_CODE_PATTERN.finditer(page_content):
+        value = match.group(1)
+        key = value.lower()
+        if key not in seen:
+            seen.add(key)
+            values.append(value)
+    return values
+
+
+def _extract_keywords(page_content: str) -> list[str]:
+    candidates: list[str] = []
+    candidates.extend(_clean_keyword(item) for item in re.findall(r"\*\*([^*]{2,40})\*\*", page_content))
+
+    for line in page_content.splitlines():
+        if any(label in line for label in ("故障定义", "根因", "解决方案", "处理建议", "排查要点", "排查步骤")):
+            candidates.extend(_keyword_tokens(line))
+
+    candidates.extend(
+        token
+        for token, _ in Counter(_keyword_tokens(page_content)).most_common(30)
+    )
+
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        keyword = _clean_keyword(candidate)
+        if not keyword or keyword in STOPWORDS or keyword in seen:
+            continue
+        seen.add(keyword)
+        keywords.append(keyword)
+        if len(keywords) >= 10:
+            break
+    return keywords[:10]
+
+
+def _keyword_tokens(text: str) -> list[str]:
+    tokens = re.findall(r"[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9+/._-]{1,24}", text)
+    return [token for token in tokens if len(token) >= 2]
+
+
+def _clean_keyword(value: str) -> str:
+    value = re.sub(r"[*`#>\-：:，,。；;、（）()\[\]【】]", "", str(value)).strip()
+    return value[:40]
+
+
 def _to_tags(value: Any) -> list[str]:
     if value is None:
         return []
@@ -183,3 +383,16 @@ def _to_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+if __name__ == "__main__":
+    input_file = "线上全场景故障排查终极手册（企业级超详细完整版）.md"
+    file_path = Path(input_file)
+    if not file_path.exists():
+        file_path = Path("data/static_docs") / input_file
+    documents = split_and_extract_metadata(str(file_path))
+    for index, document in enumerate(documents, start=1):
+        print(f"[{index}] content preview:")
+        print(document.page_content[:200].replace("\n", "\\n"))
+        print("metadata:")
+        print(json.dumps(document.metadata, ensure_ascii=False, indent=2))

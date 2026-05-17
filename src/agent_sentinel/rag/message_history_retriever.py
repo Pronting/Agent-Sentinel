@@ -38,12 +38,10 @@ class MessageHistoryRetriever:
         return docs
 
     def _build_message_expr(self, filters: RagFilters | None) -> str | None:
-        clauses: list[str] = []
+        clauses: list[str] = ['doc_type == "alert_case"']
         if self.default_days > 0:
             min_created_at = int(time.time()) - self.default_days * 86400
             clauses.append(f"created_at >= {min_created_at}")
-        if filters and filters.chat_id:
-            clauses.append(f'chat_id == "{filters.chat_id}"')
         return " and ".join(clauses) if clauses else None
 
     def _recency_boost(self, now: int, created_at: int | None) -> float:

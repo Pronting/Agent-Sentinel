@@ -12,6 +12,7 @@ dependencies = [
   "fastapi>=0.115.0",
   "langchain>=0.3.0",
   "langchain-core>=0.3.0",
+  "langchain-text-splitters>=0.3.0",
   "langchain-openai>=0.2.0",
   "langgraph>=0.2.60",
   "lark-oapi>=1.4.18",
@@ -21,6 +22,7 @@ dependencies = [
   "pyyaml>=6.0.2",
   "redis>=5.2.0",
   "requests>=2.32.0",
+  "aiohttp>=3.10.0",
   "tenacity>=8.5.0",
   "uvicorn>=0.32.0",
 ]
