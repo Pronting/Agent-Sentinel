@@ -15,13 +15,19 @@ def _to_bool(value: str | None, default: bool = False) -> bool:
 def _to_float(value: str | None, default: float) -> float:
     if value is None or value == "":
         return default
-    return float(value)
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def _to_int(value: str | None, default: int) -> int:
     if value is None or value == "":
         return default
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def _to_list(value: str | None) -> list[str]:
@@ -106,6 +112,13 @@ class Settings:
     embedding_mock_enabled: bool = False
     interactive_topic_enabled: bool = True
     interactive_topic_wait_seconds: int = 5
+    tools_provider: str = "mock"
+    sls_endpoint: str | None = None
+    sls_access_key_id: str | None = None
+    sls_access_key_secret: str | None = None
+    sls_project: str | None = None
+    sls_logstore: str | None = None
+    sls_query_time_range_seconds: int = 300
 
 
 def get_settings() -> Settings:
@@ -262,6 +275,13 @@ def get_settings() -> Settings:
         ),
         interactive_topic_enabled=_to_bool(os.getenv("INTERACTIVE_TOPIC_ENABLED"), True),
         interactive_topic_wait_seconds=_to_int(os.getenv("INTERACTIVE_TOPIC_WAIT_SECONDS"), 5),
+        tools_provider=os.getenv("TOOLS_PROVIDER", "mock"),
+        sls_endpoint=os.getenv("SLS_ENDPOINT"),
+        sls_access_key_id=os.getenv("SLS_ACCESS_KEY_ID"),
+        sls_access_key_secret=os.getenv("SLS_ACCESS_KEY_SECRET"),
+        sls_project=os.getenv("SLS_PROJECT"),
+        sls_logstore=os.getenv("SLS_LOGSTORE"),
+        sls_query_time_range_seconds=_to_int(os.getenv("SLS_QUERY_TIME_RANGE_SECONDS"), 300),
     )
 
 

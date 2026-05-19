@@ -25,6 +25,7 @@ dependencies = [
   "aiohttp>=3.10.0",
   "tenacity>=8.5.0",
   "uvicorn>=0.32.0",
+  "aliyun-log-python-sdk>=0.8.0",
 ]
 
 [project.optional-dependencies]
