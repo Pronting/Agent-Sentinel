@@ -40,6 +40,14 @@ def build_retriever(settings: Settings) -> BaseRetriever:
             db_name=settings.milvus_db_name,
         )
     )
+    pruning_config = {
+        "reranker_model_name": settings.rag_reranker_model_name,
+        "reranker_device": settings.rag_reranker_device,
+        "reranker_api_endpoint": settings.rag_reranker_api_endpoint,
+        "reranker_api_key": settings.rag_reranker_api_key,
+        "reranker_api_format": settings.rag_reranker_api_format,
+        "reranker_timeout_seconds": settings.rag_reranker_timeout_seconds,
+    }
 
     retrievers: list[BaseRetriever] = []
     if settings.rag_static_enabled:
@@ -50,6 +58,9 @@ def build_retriever(settings: Settings) -> BaseRetriever:
                 collection_name=settings.rag_static_collection,
                 top_k=settings.rag_static_top_k,
                 weight=settings.rag_static_weight,
+                recall_top_k=settings.rag_static_recall_top_k,
+                pruning_enabled=settings.rag_pruning_enabled,
+                pruning_config=pruning_config,
             )
         )
     if settings.rag_message_enabled:
@@ -61,6 +72,9 @@ def build_retriever(settings: Settings) -> BaseRetriever:
                 top_k=settings.rag_message_top_k,
                 weight=settings.rag_message_weight,
                 default_days=settings.rag_message_default_days,
+                prune_top_k=settings.rag_history_prune_top_k,
+                pruning_enabled=settings.rag_pruning_enabled,
+                pruning_config=pruning_config,
             )
         )
 

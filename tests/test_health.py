@@ -56,6 +56,17 @@ def test_health_endpoint() -> None:
     assert response.json() == {"status": "ok", "app": "Agent Sentinel"}
 
 
+def test_metrics_endpoint_exposes_prometheus_text() -> None:
+    app = build_app(make_settings())
+    client = TestClient(app)
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+    assert "workflow_node_duration_seconds" in response.text or "prometheus_client is not installed" in response.text
+
+
 def test_report_alert_endpoint_records_event() -> None:
     app = build_app(make_settings())
     client = TestClient(app)

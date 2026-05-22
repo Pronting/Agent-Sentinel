@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from agent_sentinel.agents.feedback_learning import feedback_learning_node
 from agent_sentinel.agents.understand_agent import understand_node
@@ -83,6 +84,35 @@ def test_understand_node_adopts_history_case_without_downstream_nodes() -> None:
         assert state["human_decision"] == "cache_approved"
         assert state["need_human"] is False
         assert state["recommended_plan"]["summary"] == "重启连接池并扩容 worker"
+
+    asyncio.run(run())
+
+
+def test_understand_node_logs_processed_alert_summary(caplog) -> None:
+    async def run() -> None:
+        with caplog.at_level(logging.INFO, logger="agent_sentinel.agents.understand_agent"):
+            state = await understand_node(
+                {
+                    "raw_alert": {"summary": "CPU 飙升", "details": "worker timeout"},
+                    "chat_id": "oc_chat",
+                    "thread_root_message_id": "om_root",
+                    "workflow_thread_id": "wf-log",
+                    "workflow_run_id": "run-log",
+                    "messages": [],
+                    "evidence": [],
+                },
+                llm=FakeLLM(),
+                case_store=None,
+            )
+
+        assert state["alert_summary"]
+        messages = [record.getMessage() for record in caplog.records]
+        summary_logs = [message for message in messages if "Understand node alert summary" in message]
+        assert summary_logs
+        assert "trace_id=oc_chat_om_root" in summary_logs[-1]
+        assert "chat_id=oc_chat" in summary_logs[-1]
+        assert "workflow_thread_id=wf-log" in summary_logs[-1]
+        assert "summary_chars=" in summary_logs[-1]
 
     asyncio.run(run())
 

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import threading
+import time
 from typing import Callable
 
 from agent_sentinel.config import Settings
@@ -34,6 +35,7 @@ class FeishuLongConnectionBot:
 
     def start(self) -> None:
         if self._started:
+            logger.info("Feishu long connection listener already started.")
             return
         if not self.settings.feishu_long_connection_enabled:
             logger.info("Feishu long connection listener is disabled.")
@@ -55,6 +57,7 @@ class FeishuLongConnectionBot:
         )
         self._thread.start()
         self._started = True
+        logger.info("Feishu long connection listener thread started.")
 
     def _run_forever(self) -> None:
         import lark_oapi as lark
@@ -81,6 +84,7 @@ class FeishuLongConnectionBot:
         ws_client.start()
 
     def _handle_message_event(self, data: object) -> None:
+        started = time.perf_counter()
         try:
             import lark_oapi as lark
 
@@ -88,25 +92,46 @@ class FeishuLongConnectionBot:
             event = payload.get("event") or {}
             sender = event.get("sender") or {}
             if sender.get("sender_type") != "user":
+                logger.info("Longconn message ignored sender_type=%s", sender.get("sender_type"))
                 return
 
             message = event.get("message") or {}
             chat_id = str(message.get("chat_id") or "")
             if not chat_id:
+                logger.info("Longconn message ignored missing chat_id")
                 return
 
             if self.settings.feishu_allowed_chat_ids and chat_id not in self.settings.feishu_allowed_chat_ids:
+                logger.info("Longconn message ignored chat_id not allowed chat_id=%s", chat_id)
                 return
 
             chat_type = str(message.get("chat_type") or "")
             mentions = message.get("mentions") or []
             if self.settings.feishu_analyze_mention_only and chat_type != "p2p" and not mentions:
+                logger.info(
+                    "Longconn message ignored mention required chat_id=%s chat_type=%s message_id=%s",
+                    chat_id,
+                    chat_type,
+                    message.get("message_id"),
+                )
                 return
 
             content_text = extract_text_from_message_content(message.get("content"))
             if not content_text.strip():
+                logger.info("Longconn message ignored empty content chat_id=%s message_id=%s", chat_id, message.get("message_id"))
                 return
 
+            root_message_id = str(message.get("root_id") or "") or str(message.get("message_id") or "") or None
+            logger.info(
+                "Longconn message routed chat_id=%s message_id=%s root_message_id=%s chat_type=%s mentions=%s content_chars=%s elapsed_ms=%s",
+                chat_id,
+                message.get("message_id"),
+                root_message_id,
+                chat_type,
+                len(mentions),
+                len(content_text),
+                int((time.perf_counter() - started) * 1000),
+            )
             self.analyze_callback(
                 chat_id,
                 "feishu-user",
@@ -116,7 +141,7 @@ class FeishuLongConnectionBot:
                 content_text,
                 "user_message",
                 ["feishu", "long-connection"],
-                str(message.get("root_id") or "") or str(message.get("message_id") or "") or None,
+                root_message_id,
                 self._extract_sender_open_id(sender),
                 self._extract_sender_name(sender),
             )
@@ -130,6 +155,14 @@ class FeishuLongConnectionBot:
             import lark_oapi as lark
 
             payload = json.loads(lark.JSON.marshal(data))
+            value = payload.get("action", {}).get("value", {}) if isinstance(payload.get("action"), dict) else {}
+            logger.info(
+                "Longconn card action received task_id=%s node=%s action=%s payload_keys=%s",
+                value.get("task_id") or value.get("decision_id"),
+                value.get("node_name") or value.get("node"),
+                value.get("action") or value.get("decision"),
+                sorted(payload.keys()),
+            )
             threading.Thread(
                 target=self._run_card_action_payload,
                 args=(payload,),

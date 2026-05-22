@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import logging
+import time
+
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 from agent_sentinel.config import Settings
 from agent_sentinel.llm import build_chat_model
+from agent_sentinel.llm.executor import _estimate_tokens
+from agent_sentinel.monitoring import monitor
+
+logger = logging.getLogger(__name__)
 
 
 class SingleTurnChatService:
@@ -24,7 +31,15 @@ class SingleTurnChatService:
         self.chain = self.prompt | self.model | StrOutputParser()
 
     def reply_once(self, user_input: str) -> str:
-        return self.chain.invoke({"user_input": user_input})
+        payload = {"user_input": user_input}
+        prompt_text = self.prompt.invoke(payload).to_string()
+        return _invoke_chain_with_monitoring(
+            self.chain,
+            payload,
+            model=self.settings.openai_model,
+            prompt_text=prompt_text,
+            operation="single_turn_chat",
+        )
 
 
 class AlertAnalysisService:
@@ -69,14 +84,51 @@ class AlertAnalysisService:
         trigger_type: str = "unknown",
         tags: list[str] | None = None,
     ) -> str:
-        return self.chain.invoke(
-            {
-                "source": source,
-                "level": level,
-                "summary": summary,
-                "details": details or "",
-                "raw_text": raw_text or "",
-                "trigger_type": trigger_type,
-                "tags": ", ".join(tags or []),
-            }
+        payload = {
+            "source": source,
+            "level": level,
+            "summary": summary,
+            "details": details or "",
+            "raw_text": raw_text or "",
+            "trigger_type": trigger_type,
+            "tags": ", ".join(tags or []),
+        }
+        prompt_text = self.prompt.invoke(payload).to_string()
+        return _invoke_chain_with_monitoring(
+            self.chain,
+            payload,
+            model=self.settings.openai_model,
+            prompt_text=prompt_text,
+            operation="alert_analysis",
         )
+
+
+def _invoke_chain_with_monitoring(chain: object, payload: dict[str, str], *, model: str, prompt_text: str, operation: str) -> str:
+    started = time.perf_counter()
+    try:
+        result = chain.invoke(payload)  # type: ignore[attr-defined]
+    except TimeoutError:
+        monitor.record_error("llm_timeout")
+        raise
+    except Exception:
+        monitor.record_error("llm_error")
+        raise
+
+    duration_seconds = time.perf_counter() - started
+    content = str(result)
+    prompt_tokens = _estimate_tokens(prompt_text)
+    completion_tokens = _estimate_tokens(content)
+    monitor.record_llm_call(model, duration_seconds)
+    monitor.record_tokens(model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+    logger.info(
+        "LLM chain call completed operation=%s model=%s elapsed_ms=%s prompt_chars=%s response_chars=%s "
+        "prompt_tokens=%s completion_tokens=%s token_usage_source=estimated",
+        operation,
+        model,
+        int(duration_seconds * 1000),
+        len(prompt_text),
+        len(content),
+        prompt_tokens,
+        completion_tokens,
+    )
+    return content

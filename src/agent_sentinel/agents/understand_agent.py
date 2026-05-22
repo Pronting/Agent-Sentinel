@@ -11,6 +11,7 @@ from agent_sentinel.feishu.card_handler import DecisionContext, HumanDecisionSto
 from agent_sentinel.feishu.sender import FeishuSender
 from agent_sentinel.graph.state import DiagnosisState, append_evidence, append_message
 from agent_sentinel.llm.executor import LLMExecutor
+from agent_sentinel.monitoring import monitor, trace_id_from_state
 from agent_sentinel.rag.history_cases import HistoryCaseStore, build_alert_text, case_to_dict, final_plan_from_case
 from agent_sentinel.utils.config_loader import format_prompt
 from agent_sentinel.utils.retry_utils import async_retry
@@ -34,6 +35,14 @@ async def understand_node(
     async with asyncio.timeout(10):
         summary = await llm.call(prompt)
     logger.info("Node understand completed summary_chars=%s", len(summary))
+    logger.info(
+        "Understand node alert summary trace_id=%s chat_id=%s workflow_thread_id=%s summary_chars=%s summary=%s",
+        trace_id_from_state(state),
+        state.get("chat_id") or "unknown",
+        state.get("workflow_thread_id") or "unknown",
+        len(summary),
+        _truncate_log_text(summary),
+    )
     base_update: DiagnosisState = {
         "alert_summary": summary,
         "messages": append_message(state, "assistant", f"告警理解完成: {summary}"),
@@ -41,6 +50,7 @@ async def understand_node(
     }
 
     if not cache_enabled or not case_store:
+        monitor.record_cache_miss(state.get("chat_id"))
         return base_update
 
     alert_text = build_alert_text(state.get("raw_alert", {}))
@@ -52,6 +62,8 @@ async def understand_node(
         )
     except Exception:
         logger.exception("History case cache lookup failed; continuing workflow")
+        monitor.record_error("milvus_error")
+        monitor.record_cache_miss(state.get("chat_id"))
         return {
             **base_update,
             "evidence": append_evidence(
@@ -61,6 +73,7 @@ async def understand_node(
         }
 
     if not candidates:
+        monitor.record_cache_miss(state.get("chat_id"))
         return {
             **base_update,
             "cache_candidates": [],
@@ -71,6 +84,7 @@ async def understand_node(
     candidate_dicts = [case_to_dict(candidate) for candidate in candidates]
     if not state.get("chat_id") or not sender or not decision_store:
         logger.info("History cases found but Feishu cache decision unavailable; continuing workflow")
+        monitor.record_cache_miss(state.get("chat_id"))
         return {
             **base_update,
             "cache_candidates": candidate_dicts,
@@ -92,6 +106,7 @@ async def understand_node(
         if decision == "adopt":
             plan = final_plan_from_case(candidate)
             logger.info("History case cache adopted index=%s score=%s", index, candidate.score)
+            monitor.record_cache_hit(state.get("chat_id"))
             return {
                 **base_update,
                 "cache_candidates": candidate_dicts,
@@ -117,6 +132,7 @@ async def understand_node(
             logger.info("History case cache rejected index=%s", index)
             continue
 
+    monitor.record_cache_miss(state.get("chat_id"))
     return {
         **base_update,
         "cache_candidates": candidate_dicts,
@@ -172,3 +188,9 @@ async def _ask_case_cache_decision(
     )
     decision = str((resume_payload or {}).get("decision") or "reject")
     return decision if decision in {"adopt", "reject"} else "reject"
+
+
+def _truncate_log_text(text: str, limit: int = 1000) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."

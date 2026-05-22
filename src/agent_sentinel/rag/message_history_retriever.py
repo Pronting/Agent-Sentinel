@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from agent_sentinel.rag.embedding import EmbeddingClient
 from agent_sentinel.rag.milvus_client import MilvusVectorClient
 from agent_sentinel.rag.models import RagFilters, RetrievedDoc
+from agent_sentinel.rag.pruning import prune_by_differential_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +20,21 @@ class MessageHistoryRetriever:
     top_k: int = 12
     weight: float = 0.45
     default_days: int = 30
+    prune_top_k: int | None = 1
+    pruning_enabled: bool = True
+    pruning_config: dict | None = None
 
     async def retrieve(self, query: str, filters: RagFilters | None = None) -> list[RetrievedDoc]:
+        started = time.perf_counter()
+        logger.info(
+            "Message history RAG start collection=%s query_chars=%s recall_top_k=%s prune_top_k=%s pruning_enabled=%s default_days=%s",
+            self.collection_name,
+            len(query or ""),
+            self.top_k,
+            self.prune_top_k,
+            self.pruning_enabled,
+            self.default_days,
+        )
         query_embedding = await self.embedding.embed(query)
         expr = self._build_message_expr(filters)
         docs = await self.milvus.search(
@@ -30,12 +44,42 @@ class MessageHistoryRetriever:
             source_type="message_history",
             expr=expr,
         )
+        recalled_count = len(docs)
+        docs = self._prune(query, docs)
         now = int(time.time())
         for doc in docs:
             recency_boost = self._recency_boost(now, doc.created_at)
-            doc.weighted_score = doc.score * self.weight * recency_boost
-        logger.info("Message history RAG completed docs=%s", len(docs))
+            score = float(doc.metadata.get("combined_score") or doc.score)
+            doc.weighted_score = score * self.weight * recency_boost
+        logger.info(
+            "Message history RAG completed collection=%s recalled=%s returned=%s scores=%s elapsed_ms=%s",
+            self.collection_name,
+            recalled_count,
+            len(docs),
+            _format_doc_scores(docs),
+            int((time.perf_counter() - started) * 1000),
+        )
         return docs
+
+    def _prune(self, query: str, docs: list[RetrievedDoc]) -> list[RetrievedDoc]:
+        top_k = self.prune_top_k or self.top_k
+        if not self.pruning_enabled or len(docs) <= top_k:
+            logger.info(
+                "Message history RAG pruning skipped recalled=%s top_k=%s pruning_enabled=%s",
+                len(docs),
+                top_k,
+                self.pruning_enabled,
+            )
+            return docs
+        candidates = [_doc_to_candidate(index, doc, "history") for index, doc in enumerate(docs)]
+        pruned = prune_by_differential_strategy(
+            query,
+            candidates,
+            top_k=top_k,
+            config=self.pruning_config,
+        )
+        logger.info("Message history RAG pruning completed before=%s after=%s", len(docs), len(pruned))
+        return [_apply_pruning_scores(docs[int(item["_index"])], item) for item in pruned]
 
     def _build_message_expr(self, filters: RagFilters | None) -> str | None:
         clauses: list[str] = ['doc_type == "alert_case"']
@@ -53,3 +97,33 @@ class MessageHistoryRetriever:
         if age_days <= 30:
             return 1.0
         return 0.8
+
+
+def _doc_to_candidate(index: int, doc: RetrievedDoc, source_type: str) -> dict:
+    return {
+        "_index": index,
+        "text": doc.text,
+        "score": doc.score,
+        "metadata": doc.metadata,
+        "source_type": source_type,
+    }
+
+
+def _apply_pruning_scores(doc: RetrievedDoc, candidate: dict) -> RetrievedDoc:
+    metadata = dict(doc.metadata)
+    for key in ("metadata_score", "combined_score", "rerank_score"):
+        if key in candidate:
+            metadata[key] = candidate[key]
+    doc.metadata = metadata
+    return doc
+
+
+def _format_doc_scores(docs: list[RetrievedDoc], limit: int = 5) -> str:
+    if not docs:
+        return "[]"
+    values = []
+    for doc in docs[:limit]:
+        score = doc.metadata.get("combined_score") or doc.score
+        values.append(f"{doc.id}:{float(score):.4f}")
+    suffix = ", ..." if len(docs) > limit else ""
+    return "[" + ", ".join(values) + suffix + "]"

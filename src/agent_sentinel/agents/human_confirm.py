@@ -8,6 +8,7 @@ from langgraph.types import interrupt
 from agent_sentinel.feishu.card_handler import DecisionContext, HumanDecisionStore
 from agent_sentinel.feishu.sender import FeishuSender
 from agent_sentinel.graph.state import DiagnosisState, append_evidence, append_message
+from agent_sentinel.monitoring import monitor
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ async def human_confirm_node(
     logger.info("Node human_confirm started enabled=%s", enabled)
     if not enabled or not state.get("need_human", True) or not state.get("chat_id"):
         logger.info("Node human_confirm auto-approved")
+        monitor.record_feedback(True, state.get("chat_id"))
         return {
             "human_decision": "approved",
             "messages": append_message(state, "assistant", "无需人工确认，自动继续。"),
@@ -59,6 +61,10 @@ async def human_confirm_node(
     decision = str((resume_payload or {}).get("decision") or "timeout")
     feedback = str((resume_payload or {}).get("feedback") or "")
     logger.info("Node human_confirm completed decision=%s", decision)
+    if decision == "approved":
+        monitor.record_feedback(True, state.get("chat_id"))
+    elif decision == "rejected":
+        monitor.record_feedback(False, state.get("chat_id"))
     evidence = append_evidence(state, f"Human confirmation decision={decision}.")
     messages = append_message(state, "assistant", f"人工确认结果: {decision}")
     if decision == "rejected" and feedback:

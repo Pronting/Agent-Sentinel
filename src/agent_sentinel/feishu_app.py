@@ -10,6 +10,7 @@ import aiohttp
 import requests
 
 from agent_sentinel.config import Settings
+from agent_sentinel.monitoring import monitor
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,14 @@ class FeishuBotClient:
                 "content": json.dumps({"text": final_text}, ensure_ascii=False),
             }
 
+        started = time.perf_counter()
+        logger.info(
+            "Feishu send text request chat_id=%s thread_root_message_id=%s text_chars=%s mention=%s",
+            chat_id,
+            thread_root_message_id,
+            len(final_text),
+            bool(mention_open_id),
+        )
         response = requests.post(
             url,
             headers={
@@ -70,7 +79,14 @@ class FeishuBotClient:
         response.raise_for_status()
         result = response.json()
         if result.get("code") not in (0, "0", None):
+            monitor.record_error("feishu_api_error")
             raise RuntimeError(f"Feishu send message failed: {result}")
+        logger.info(
+            "Feishu send text completed chat_id=%s thread_root_message_id=%s elapsed_ms=%s",
+            chat_id,
+            thread_root_message_id,
+            int((time.perf_counter() - started) * 1000),
+        )
         return True
 
     def send_interactive_card_to_chat(
@@ -98,6 +114,8 @@ class FeishuBotClient:
                 "content": json.dumps(card, ensure_ascii=False),
             }
 
+        started = time.perf_counter()
+        logger.info("Feishu send card request chat_id=%s thread_root_message_id=%s", chat_id, thread_root_message_id)
         response = requests.post(
             url,
             headers={
@@ -110,7 +128,14 @@ class FeishuBotClient:
         response.raise_for_status()
         result = response.json()
         if result.get("code") not in (0, "0", None):
+            monitor.record_error("feishu_api_error")
             raise RuntimeError(f"Feishu send card failed: {result}")
+        logger.info(
+            "Feishu send card completed chat_id=%s thread_root_message_id=%s elapsed_ms=%s",
+            chat_id,
+            thread_root_message_id,
+            int((time.perf_counter() - started) * 1000),
+        )
         return True
 
     def send_topic_text(self, chat_id: str, root_message_id: str, text: str) -> str | None:
@@ -123,6 +148,8 @@ class FeishuBotClient:
             "content": json.dumps({"text": text}, ensure_ascii=False),
             "reply_in_thread": True,
         }
+        started = time.perf_counter()
+        logger.info("Feishu send topic text request chat_id=%s root_message_id=%s text_chars=%s", chat_id, root_message_id, len(text))
         response = requests.post(
             url,
             headers={
@@ -135,9 +162,18 @@ class FeishuBotClient:
         response.raise_for_status()
         result = response.json()
         if result.get("code") not in (0, "0", None):
+            monitor.record_error("feishu_api_error")
             raise RuntimeError(f"Feishu send topic text failed: {result}")
         data = result.get("data") or {}
-        return data.get("message_id") if isinstance(data, dict) else None
+        message_id = data.get("message_id") if isinstance(data, dict) else None
+        logger.info(
+            "Feishu send topic text completed chat_id=%s root_message_id=%s message_id=%s elapsed_ms=%s",
+            chat_id,
+            root_message_id,
+            message_id,
+            int((time.perf_counter() - started) * 1000),
+        )
+        return message_id
 
     def send_topic_card(self, chat_id: str, root_message_id: str, card: dict[str, object]) -> str | None:
         """Send an interactive card in the source message thread and return message_id."""
@@ -149,6 +185,8 @@ class FeishuBotClient:
             "content": json.dumps(card, ensure_ascii=False),
             "reply_in_thread": True,
         }
+        started = time.perf_counter()
+        logger.info("Feishu send topic card request chat_id=%s root_message_id=%s", chat_id, root_message_id)
         response = requests.post(
             url,
             headers={
@@ -161,9 +199,18 @@ class FeishuBotClient:
         response.raise_for_status()
         result = response.json()
         if result.get("code") not in (0, "0", None):
+            monitor.record_error("feishu_api_error")
             raise RuntimeError(f"Feishu send topic card failed: {result}")
         data = result.get("data") or {}
-        return data.get("message_id") if isinstance(data, dict) else None
+        message_id = data.get("message_id") if isinstance(data, dict) else None
+        logger.info(
+            "Feishu send topic card completed chat_id=%s root_message_id=%s message_id=%s elapsed_ms=%s",
+            chat_id,
+            root_message_id,
+            message_id,
+            int((time.perf_counter() - started) * 1000),
+        )
+        return message_id
 
     def update_message_card(self, message_id: str, card: dict[str, object]) -> bool:
         """Best-effort update for a bot-sent interactive card."""
@@ -171,6 +218,8 @@ class FeishuBotClient:
         token = self._get_tenant_access_token()
         url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages/{message_id}"
         payload = {"content": json.dumps(card, ensure_ascii=False)}
+        started = time.perf_counter()
+        logger.info("Feishu update message card request message_id=%s", message_id)
         response = requests.patch(
             url,
             headers={
@@ -183,7 +232,9 @@ class FeishuBotClient:
         response.raise_for_status()
         result = response.json()
         if result.get("code") not in (0, "0", None):
+            monitor.record_error("feishu_api_error")
             raise RuntimeError(f"Feishu update message card failed: {result}")
+        logger.info("Feishu update message card completed message_id=%s elapsed_ms=%s", message_id, int((time.perf_counter() - started) * 1000))
         return True
 
     async def update_message_card_async(self, message_id: str, card: dict[str, object]) -> bool:
@@ -193,6 +244,8 @@ class FeishuBotClient:
         url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages/{message_id}"
         payload = {"content": json.dumps(card, ensure_ascii=False)}
         timeout = aiohttp.ClientTimeout(total=self.timeout)
+        started = time.perf_counter()
+        logger.info("Feishu async update message card request message_id=%s", message_id)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.patch(
                 url,
@@ -205,7 +258,9 @@ class FeishuBotClient:
                 response.raise_for_status()
                 result = await response.json()
         if result.get("code") not in (0, "0", None):
+            monitor.record_error("feishu_api_error")
             raise RuntimeError(f"Feishu async update message card failed: {result}")
+        logger.info("Feishu async update message card completed message_id=%s elapsed_ms=%s", message_id, int((time.perf_counter() - started) * 1000))
         return True
 
     def list_chat_messages(
@@ -218,6 +273,8 @@ class FeishuBotClient:
         self._ensure_configured()
         token = self._get_tenant_access_token()
         url = f"{self.settings.feishu_api_base_url.rstrip('/')}/open-apis/im/v1/messages"
+        started = time.perf_counter()
+        logger.info("Feishu list messages request chat_id=%s page_size=%s sort_type=%s", chat_id, page_size, sort_type)
         response = requests.get(
             url,
             headers={"Authorization": f"Bearer {token}"},
@@ -232,9 +289,11 @@ class FeishuBotClient:
         response.raise_for_status()
         result = response.json()
         if result.get("code") not in (0, "0", None):
+            monitor.record_error("feishu_api_error")
             raise RuntimeError(f"Feishu list messages failed: {result}")
         data = result.get("data") or {}
         items = data.get("items") or []
+        logger.info("Feishu list messages completed chat_id=%s count=%s elapsed_ms=%s", chat_id, len(items), int((time.perf_counter() - started) * 1000))
         return [item for item in items if isinstance(item, dict)]
 
     def _ensure_configured(self) -> None:
@@ -245,12 +304,15 @@ class FeishuBotClient:
         now = time.time()
         with self._lock:
             if self._token and now < self._token_expire_at:
+                logger.debug("Feishu tenant access token cache hit expires_in_seconds=%s", int(self._token_expire_at - now))
                 return self._token
 
             url = (
                 f"{self.settings.feishu_api_base_url.rstrip('/')}"
                 "/open-apis/auth/v3/tenant_access_token/internal"
             )
+            started = time.perf_counter()
+            logger.info("Feishu tenant access token refresh started")
             response = requests.post(
                 url,
                 json={
@@ -262,15 +324,18 @@ class FeishuBotClient:
             response.raise_for_status()
             result = response.json()
             if result.get("code") not in (0, "0", None):
+                monitor.record_error("feishu_api_error")
                 raise RuntimeError(f"Feishu tenant_access_token fetch failed: {result}")
 
             token = result.get("tenant_access_token")
             if not token:
+                monitor.record_error("feishu_api_error")
                 raise RuntimeError("Feishu tenant_access_token is missing in response.")
 
             expire = int(result.get("expire", 7200))
             self._token = token
             self._token_expire_at = now + max(expire - 120, 60)
+            logger.info("Feishu tenant access token refresh completed expire_seconds=%s elapsed_ms=%s", expire, int((time.perf_counter() - started) * 1000))
             return token
 
 

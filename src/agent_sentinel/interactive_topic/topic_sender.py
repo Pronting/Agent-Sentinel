@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from agent_sentinel.feishu_app import FeishuBotClient
@@ -16,9 +17,12 @@ class WorkflowStep:
 
 
 WORKFLOW_STEPS: tuple[WorkflowStep, ...] = (
+    WorkflowStep("understand", "告警理解"),
     WorkflowStep("cache_check", "告警理解（缓存查找）"),
     WorkflowStep("rag_retrieve", "RAG检索"),
     WorkflowStep("tool_call", "实时数据"),
+    WorkflowStep("generate_plan", "生成方案"),
+    WorkflowStep("validate", "方案校验"),
     WorkflowStep("summary", "方案生成"),
 )
 
@@ -62,12 +66,22 @@ class InteractiveTopicSender:
             feedback_buttons=False,
         )
         try:
-            return await asyncio.to_thread(
+            started = time.perf_counter()
+            message_id = await asyncio.to_thread(
                 self.client.send_topic_card,
                 chat_id,
                 root_message_id,
                 card,
             )
+            logger.info(
+                "Interactive workflow card sent task_id=%s chat_id=%s root_message_id=%s message_id=%s elapsed_ms=%s",
+                task_id,
+                chat_id,
+                root_message_id,
+                message_id,
+                int((time.perf_counter() - started) * 1000),
+            )
+            return message_id
         except Exception:
             logger.exception(
                 "Failed to send interactive workflow card chat_id=%s root=%s task_id=%s",
@@ -111,7 +125,19 @@ class InteractiveTopicSender:
         lock = await self._get_update_lock(message_id)
         async with lock:
             try:
-                return await self.client.update_message_card_async(message_id, card)
+                started = time.perf_counter()
+                result = await self.client.update_message_card_async(message_id, card)
+                logger.info(
+                    "Interactive workflow card updated task_id=%s message_id=%s current_node=%s buttons_node=%s feedback_buttons=%s statuses=%s elapsed_ms=%s",
+                    task_id,
+                    message_id,
+                    current_node,
+                    buttons_node,
+                    feedback_buttons,
+                    node_statuses,
+                    int((time.perf_counter() - started) * 1000),
+                )
+                return result
             except Exception:
                 logger.exception("Failed to update interactive workflow card message_id=%s", message_id)
                 return False

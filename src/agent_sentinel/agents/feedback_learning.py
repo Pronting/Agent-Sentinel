@@ -8,6 +8,7 @@ from langgraph.types import interrupt
 from agent_sentinel.feishu.card_handler import DecisionContext, HumanDecisionStore
 from agent_sentinel.feishu.sender import FeishuSender
 from agent_sentinel.graph.state import DiagnosisState, append_evidence, append_message
+from agent_sentinel.monitoring import monitor
 from agent_sentinel.rag.history_cases import HistoryCaseStore
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ async def feedback_learning_node(
 
     if decision == "valid":
         case_id = await case_store.save_case_to_history(state)
+        monitor.record_feedback(True, state.get("chat_id"))
         await sender.send_message(
             state.get("chat_id"),
             f"✅ 已存入历史案例知识库：{case_id}",
@@ -82,6 +84,7 @@ async def feedback_learning_node(
         }
 
     logger.info("Feedback learning skipped by user decision=%s", decision)
+    monitor.record_feedback(False, state.get("chat_id"))
     return {
         "feedback_decision_id": decision_id,
         "feedback_card_sent": True,

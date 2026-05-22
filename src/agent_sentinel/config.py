@@ -70,6 +70,8 @@ class Settings:
     alert_api_token: str | None
     alert_dedup_window_seconds: int
     alert_store_limit: int
+    metrics_enabled: bool = True
+    metrics_port: int | None = None
     aiops_workflow_config_path: str = "config/workflow.yaml"
     aiops_llm_models: list[str] = field(default_factory=lambda: ["gpt-4o-mini"])
     aiops_llm_timeout_seconds: int = 15
@@ -94,6 +96,15 @@ class Settings:
     rag_case_cache_threshold: float = 0.85
     rag_case_cache_top_k: int = 2
     rag_feedback_enabled: bool = True
+    rag_pruning_enabled: bool = True
+    rag_history_prune_top_k: int = 1
+    rag_static_recall_top_k: int = 10
+    rag_reranker_model_name: str = "qwen3-rerank"
+    rag_reranker_device: str = "cpu"
+    rag_reranker_api_endpoint: str | None = None
+    rag_reranker_api_key: str | None = None
+    rag_reranker_api_format: str = "auto"
+    rag_reranker_timeout_seconds: int = 15
     milvus_uri: str | None = None
     milvus_token: str | None = None
     milvus_user: str | None = None
@@ -170,6 +181,8 @@ def get_settings() -> Settings:
         alert_api_token=os.getenv("ALERT_API_TOKEN"),
         alert_dedup_window_seconds=_to_int(os.getenv("ALERT_DEDUP_WINDOW_SECONDS"), 60),
         alert_store_limit=_to_int(os.getenv("ALERT_STORE_LIMIT"), 100),
+        metrics_enabled=_to_bool(os.getenv("METRICS_ENABLED"), True),
+        metrics_port=_to_int(os.getenv("METRICS_PORT"), 0) or None,
         aiops_workflow_config_path=os.getenv(
             "AIOPS_WORKFLOW_CONFIG_PATH",
             str(workflow_cfg.get("config_path", "config/workflow.yaml")),
@@ -241,6 +254,15 @@ def get_settings() -> Settings:
             os.getenv("RAG_FEEDBACK_ENABLED"),
             bool(message_cfg.get("feedback_enabled", True)),
         ),
+        rag_pruning_enabled=_to_bool(os.getenv("RAG_PRUNING_ENABLED"), True),
+        rag_history_prune_top_k=_to_int(os.getenv("RAG_HISTORY_PRUNE_TOP_K"), 1),
+        rag_static_recall_top_k=_to_int(os.getenv("RAG_STATIC_RECALL_TOP_K"), 10),
+        rag_reranker_model_name=os.getenv("RAG_RERANKER_MODEL_NAME", "qwen3-rerank"),
+        rag_reranker_device=os.getenv("RAG_RERANKER_DEVICE", "cpu"),
+        rag_reranker_api_endpoint=os.getenv("RAG_RERANKER_API_ENDPOINT"),
+        rag_reranker_api_key=os.getenv("RAG_RERANKER_API_KEY"),
+        rag_reranker_api_format=os.getenv("RAG_RERANKER_API_FORMAT", "auto"),
+        rag_reranker_timeout_seconds=_to_int(os.getenv("RAG_RERANKER_TIMEOUT_SECONDS"), 15),
         milvus_uri=os.getenv("MILVUS_URI"),
         milvus_token=os.getenv("MILVUS_TOKEN"),
         milvus_user=os.getenv("MILVUS_USER"),

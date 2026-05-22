@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +18,12 @@ class TopicTask:
     root_message_id: str
     query: str
     status: str = "running"
+    created_at_monotonic: float = 0.0
     current_node: str = ""
     card_message_id: str | None = None
     last_action: str | None = None
+    pending_node_result: str | None = None
+    pending_diagnosis_state: dict[str, Any] | None = None
     timeout_timer: threading.Timer | None = None
 
 
@@ -38,6 +42,7 @@ class TopicTaskStore:
                 chat_id=chat_id,
                 root_message_id=root_message_id,
                 query=query,
+                created_at_monotonic=time.perf_counter(),
             )
             self._tasks[task_id] = task
             logger.info("Interactive topic task created task_id=%s chat_id=%s", task_id, chat_id)
@@ -58,6 +63,8 @@ class TopicTaskStore:
         node_name: str,
         card_message_id: str | None,
         on_timeout: TimeoutCallback,
+        node_result: str | None = None,
+        diagnosis_state: dict[str, Any] | None = None,
     ) -> TopicTask | None:
         with self._lock:
             task = self._tasks.get(task_id)
@@ -71,6 +78,8 @@ class TopicTaskStore:
             task.current_node = node_name
             task.card_message_id = card_message_id
             task.last_action = None
+            task.pending_node_result = node_result
+            task.pending_diagnosis_state = diagnosis_state
             task.timeout_timer = timer
             timer.start()
             logger.info(

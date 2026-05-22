@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from agent_sentinel.graph.state import DiagnosisState
+
 
 class TopicFlowState(TypedDict, total=False):
     """State carried by the interactive topic LangGraph demo workflow."""
@@ -15,6 +17,7 @@ class TopicFlowState(TypedDict, total=False):
     last_action: str
     retry_counts: dict[str, int]
     node_results: list[dict[str, str]]
+    diagnosis_state: DiagnosisState
     final_text: str
 
 

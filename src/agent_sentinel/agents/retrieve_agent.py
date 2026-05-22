@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from agent_sentinel.graph.state import DiagnosisState, append_evidence, append_message
+from agent_sentinel.monitoring import monitor
 from agent_sentinel.rag.base import BaseRetriever
 from agent_sentinel.rag.models import RagFilters
 
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 async def retrieve_node(state: DiagnosisState, retriever: BaseRetriever) -> DiagnosisState:
     logger.info("Node retrieve started")
+    monitor.record_rag_retrieval("hybrid", state.get("chat_id"))
     filters = _build_filters(state)
     docs = await retriever.retrieve(state.get("alert_summary", ""), filters)
     prompt_docs = [doc.to_prompt_text() for doc in docs]

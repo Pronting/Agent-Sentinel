@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
+from agent_sentinel.monitoring import monitor
 from agent_sentinel.rag.models import RetrievedDoc, SourceType
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,14 @@ class MilvusVectorClient:
         if not self.config.uri:
             logger.info("Milvus URI missing; search skipped collection=%s", collection_name)
             return []
+        logger.info(
+            "Milvus search start collection=%s source_type=%s top_k=%s expr=%s embedding_dim=%s",
+            collection_name,
+            source_type,
+            top_k,
+            expr or "",
+            len(query_embedding),
+        )
         return await asyncio.to_thread(
             self._search_sync,
             collection_name,
@@ -55,7 +65,11 @@ class MilvusVectorClient:
     async def upsert(self, collection_name: str, records: list[dict[str, Any]]) -> None:
         if not records:
             return
-        await asyncio.to_thread(self._upsert_sync, collection_name, records)
+        try:
+            await asyncio.to_thread(self._upsert_sync, collection_name, records)
+        except Exception:
+            monitor.record_error("milvus_error")
+            raise
 
     def _search_sync(
         self,
@@ -66,6 +80,7 @@ class MilvusVectorClient:
         expr: str | None,
         output_fields: list[str] | None,
     ) -> list[RetrievedDoc]:
+        started = time.perf_counter()
         client = self._get_client()
         fields = output_fields or [
             "id",
@@ -92,6 +107,7 @@ class MilvusVectorClient:
                 timeout=self.config.timeout_seconds,
             )
         except Exception:
+            monitor.record_error("milvus_error")
             fallback_fields = [
                 "id",
                 "text",
@@ -129,7 +145,14 @@ class MilvusVectorClient:
         docs: list[RetrievedDoc] = []
         for hit in results[0] if results else []:
             docs.append(_hit_to_doc(hit, source_type))
-        logger.info("Milvus search completed collection=%s docs=%s", collection_name, len(docs))
+        logger.info(
+            "Milvus search completed collection=%s source_type=%s docs=%s scores=%s elapsed_ms=%s",
+            collection_name,
+            source_type,
+            len(docs),
+            _format_scores([doc.score for doc in docs]),
+            int((time.perf_counter() - started) * 1000),
+        )
         return docs
 
     def _ensure_static_doc_collection_sync(self, collection_name: str, dimension: int) -> None:
@@ -173,9 +196,10 @@ class MilvusVectorClient:
         logger.info("Milvus static doc collection created collection=%s dimension=%s", collection_name, dimension)
 
     def _upsert_sync(self, collection_name: str, records: list[dict[str, Any]]) -> None:
+        started = time.perf_counter()
         client = self._get_client()
         client.upsert(collection_name=collection_name, data=records)
-        logger.info("Milvus records upserted collection=%s count=%s", collection_name, len(records))
+        logger.info("Milvus records upserted collection=%s count=%s elapsed_ms=%s", collection_name, len(records), int((time.perf_counter() - started) * 1000))
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -249,3 +273,10 @@ def _to_int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_scores(scores: list[float], limit: int = 5) -> str:
+    if not scores:
+        return "[]"
+    suffix = ", ..." if len(scores) > limit else ""
+    return "[" + ", ".join(f"{score:.4f}" for score in scores[:limit]) + suffix + "]"

@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 
 from agent_sentinel.alerts import FeishuWebhookNotifier, RealtimeAlertService
 from agent_sentinel.config import Settings, get_settings
@@ -20,6 +21,7 @@ from agent_sentinel.graph.state import DiagnosisState
 from agent_sentinel.graph.workflow import DiagnosisWorkflow, build_llm_executor
 from agent_sentinel.interactive_topic import InteractiveTopicWorkflow
 from agent_sentinel.interactive_topic.topic_sender import InteractiveTopicSender
+from agent_sentinel.monitoring import CONTENT_TYPE_LATEST, configure_monitoring, monitor, trace_id_from_parts
 from agent_sentinel.rag.factory import build_retriever
 from agent_sentinel.rag.history_cases import build_history_case_store
 from agent_sentinel.schemas import (
@@ -46,7 +48,18 @@ def configure_logging(log_level: str) -> None:
 def build_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level)
+    configure_monitoring(enabled=settings.metrics_enabled)
     logger = logging.getLogger(__name__)
+    logger.info(
+        "App build started app=%s env=%s interactive_topic=%s rag_provider=%s feishu_longconn=%s feishu_polling=%s metrics_enabled=%s",
+        settings.app_name,
+        settings.app_env,
+        settings.interactive_topic_enabled,
+        settings.rag_provider,
+        settings.feishu_long_connection_enabled,
+        settings.feishu_message_polling_enabled,
+        settings.metrics_enabled,
+    )
 
     notifier = FeishuWebhookNotifier(
         webhook_url=settings.feishu_webhook_url,
@@ -82,6 +95,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     def get_aiops_workflow() -> DiagnosisWorkflow:
         nonlocal aiops_workflow
         if aiops_workflow is None:
+            logger.info("Initializing diagnosis workflow rag_provider=%s mock_llm=%s", settings.rag_provider, settings.aiops_mock_llm_enabled)
             aiops_workflow = DiagnosisWorkflow(
                 settings=settings,
                 llm=build_llm_executor(settings),
@@ -93,6 +107,14 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     def get_interactive_topic_workflow() -> InteractiveTopicWorkflow:
         nonlocal interactive_topic_workflow
         if interactive_topic_workflow is None:
+            logger.info(
+                "Initializing interactive topic workflow wait_seconds=%s rag_provider=%s static_top_k=%s history_top_k=%s final_top_k=%s",
+                settings.interactive_topic_wait_seconds,
+                settings.rag_provider,
+                settings.rag_static_top_k,
+                settings.rag_message_top_k,
+                settings.rag_final_top_k,
+            )
             interactive_topic_workflow = InteractiveTopicWorkflow(
                 sender=InteractiveTopicSender(
                     feishu_bot_client,
@@ -101,6 +123,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                 wait_seconds=settings.interactive_topic_wait_seconds,
                 retriever=build_retriever(settings),
                 case_store=build_history_case_store(settings),
+                llm=build_llm_executor(settings),
             )
         return interactive_topic_workflow
 
@@ -145,6 +168,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         workflow_thread_id: str | None = None,
         workflow_run_id: str | None = None,
     ) -> DiagnosisState:
+        trace_id = trace_id_from_parts(chat_id, thread_root_message_id)
         return {
             "raw_alert": {
                 "source": source,
@@ -161,6 +185,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             "mention_name": mention_name,
             "workflow_thread_id": workflow_thread_id or str(uuid.uuid4()),
             "workflow_run_id": workflow_run_id or str(uuid.uuid4()),
+            "trace_id": trace_id,
             "messages": [],
             "evidence": [],
             "retrieved_docs": [],
@@ -187,8 +212,10 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         mention_name: str | None = None,
     ) -> tuple[str, bool]:
         if not settings.alert_analysis_enabled:
+            logger.info("Diagnosis workflow skipped because alert analysis is disabled chat_id=%s source=%s", chat_id, source)
             return "Alert analysis is disabled.", False
 
+        started = time.perf_counter()
         initial_state = build_diagnosis_state(
             chat_id=chat_id,
             source=source,
@@ -203,20 +230,26 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             mention_name=mention_name,
         )
         logger.info(
-            "Starting Feishu LangGraph workflow source=%s level=%s trigger_type=%s chat_id=%s thread_root_message_id=%s workflow_thread_id=%s summary=%s",
+            "Diagnosis workflow start trace_id=%s source=%s level=%s trigger_type=%s chat_id=%s thread_root_message_id=%s workflow_thread_id=%s workflow_run_id=%s summary_chars=%s raw_chars=%s tags=%s",
+            initial_state.get("trace_id", ""),
             source,
             level,
             trigger_type,
             chat_id,
             thread_root_message_id,
             initial_state.get("workflow_thread_id", ""),
-            summary,
+            initial_state.get("workflow_run_id", ""),
+            len(summary or ""),
+            len(raw_text or details or ""),
+            tags or [],
         )
         final_state = await get_aiops_workflow().run_streaming(initial_state)
         final_text = str(final_state.get("final_text", ""))
         sent = bool(chat_id and feishu_bot_client.is_configured())
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.info(
-            "Completed Feishu LangGraph workflow source=%s trigger_type=%s chat_id=%s workflow_thread_id=%s validation_result=%s human_decision=%s evidence=%s final_text_chars=%s",
+            "Diagnosis workflow completed trace_id=%s source=%s trigger_type=%s chat_id=%s workflow_thread_id=%s validation_result=%s human_decision=%s evidence=%s final_text_chars=%s sent=%s elapsed_ms=%s",
+            final_state.get("trace_id", initial_state.get("trace_id", "")),
             source,
             trigger_type,
             chat_id,
@@ -225,12 +258,16 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             final_state.get("human_decision", "unknown"),
             len(final_state.get("evidence", [])),
             len(final_text),
+            sent,
+            elapsed_ms,
         )
         return final_text, sent
 
     async def resume_workflow_from_callback(payload: dict[str, Any], transport: str) -> dict[str, str]:
+        logger.info("Card callback received transport=%s payload_keys=%s", transport, sorted(payload.keys()))
         if settings.interactive_topic_enabled:
             interactive_result = await get_interactive_topic_workflow().handle_card_callback(payload, source=transport)
+            logger.info("Interactive topic callback result transport=%s status=%s", transport, interactive_result.get("status"))
             if interactive_result.get("status") != "ignored":
                 return interactive_result
 
@@ -274,6 +311,15 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         mention_open_id: str | None = None,
         mention_name: str | None = None,
     ) -> tuple[str, bool]:
+        logger.info(
+            "Analyze request routed chat_id=%s source=%s trigger_type=%s interactive_topic=%s root_message_id=%s query_chars=%s",
+            chat_id,
+            source,
+            trigger_type,
+            settings.interactive_topic_enabled,
+            thread_root_message_id,
+            len(raw_text or details or summary or ""),
+        )
         if settings.interactive_topic_enabled:
             root_message_id = thread_root_message_id
             if not root_message_id:
@@ -303,6 +349,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     @app.on_event("startup")
     def startup_event() -> None:
         nonlocal longconn_bot, poller_bot
+        logger.info("Application startup begin")
         if longconn_bot is None:
             longconn_bot = FeishuLongConnectionBot(
                 settings=settings,
@@ -318,6 +365,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
                 analyze_callback=analyze_and_send_to_chat,
             )
         poller_bot.start()
+        logger.info("Application startup completed")
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -330,6 +378,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             return ChatResponse(answer=answer, model=settings.openai_model)
         except Exception as exc:
             logger.exception("Single-turn chat failed")
+            monitor.record_error("chat_once_error")
             report_exception("/chat/once", exc)
             raise HTTPException(status_code=500, detail="Chat request failed.") from exc
 
@@ -348,6 +397,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             return {"status": "sent" if dispatched else "skipped"}
         except Exception as exc:
             logger.exception("Failed to send test alert")
+            monitor.record_error("alert_test_error")
             raise HTTPException(status_code=500, detail="Failed to send alert.") from exc
 
     @app.post("/alerts/report", response_model=AlertReportResponse)
@@ -375,6 +425,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             raise
         except Exception as exc:
             logger.exception("Failed to report alert")
+            monitor.record_error("alert_report_error")
             raise HTTPException(status_code=500, detail="Failed to report alert.") from exc
 
     @app.get("/alerts/recent", response_model=list[AlertRecordResponse])
@@ -415,6 +466,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             raise
         except Exception as exc:
             logger.exception("Failed to analyze alert")
+            monitor.record_error("alert_analyze_error")
             report_exception("/alerts/analyze", exc)
             raise HTTPException(status_code=500, detail="Failed to analyze alert.") from exc
 
@@ -472,6 +524,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             raise
         except Exception as exc:
             logger.exception("AIOps diagnosis failed")
+            monitor.record_error("aiops_diagnose_error")
             report_exception("/aiops/diagnose", exc)
             raise HTTPException(status_code=500, detail="AIOps diagnosis failed.") from exc
 
@@ -479,23 +532,33 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     async def feishu_card_callback(request: Request) -> dict[str, str]:
         try:
             payload = await request.json()
+            logger.info("HTTP Feishu card callback accepted payload_keys=%s", sorted(payload.keys()))
             return await resume_workflow_from_callback(payload, transport="http")
         except Exception as exc:
             logger.exception("Failed to process Feishu card callback")
+            monitor.record_error("feishu_api_error")
             raise HTTPException(status_code=500, detail="Failed to process card callback.") from exc
 
     @app.post("/webhook/card")
     async def webhook_card_callback(request: Request) -> dict[str, str]:
         try:
             payload = await request.json()
+            logger.info("HTTP webhook card callback accepted payload_keys=%s", sorted(payload.keys()))
             return await resume_workflow_from_callback(payload, transport="http")
         except Exception as exc:
             logger.exception("Failed to process webhook card callback")
+            monitor.record_error("feishu_api_error")
             raise HTTPException(status_code=500, detail="Failed to process card callback.") from exc
 
     @app.post("/feishu/events")
     async def feishu_events(payload: FeishuEventEnvelope) -> dict[str, object]:
         try:
+            logger.info(
+                "HTTP Feishu event received type=%s challenge=%s event_type=%s",
+                payload.type,
+                bool(payload.challenge),
+                payload.header.event_type if payload.header else None,
+            )
             if payload.challenge:
                 return {"challenge": payload.challenge}
             if payload.type == "url_verification":
@@ -514,28 +577,34 @@ def build_app(settings: Settings | None = None) -> FastAPI:
 
             header = payload.header
             if header is None or header.event_type != "im.message.receive_v1":
+                logger.info("HTTP Feishu event ignored unsupported event_type=%s", header.event_type if header else None)
                 return {"status": "ignored"}
 
             event = payload.event or {}
             sender = event.get("sender") or {}
             sender_type = sender.get("sender_type")
             if sender_type and sender_type != "user":
+                logger.info("HTTP Feishu event ignored sender_type=%s", sender_type)
                 return {"status": "ignored"}
 
             message = event.get("message") or {}
             chat_id = str(message.get("chat_id") or "")
             if not chat_id:
+                logger.info("HTTP Feishu event ignored missing chat_id")
                 return {"status": "ignored"}
 
             if settings.feishu_allowed_chat_ids and chat_id not in settings.feishu_allowed_chat_ids:
+                logger.info("HTTP Feishu event ignored chat_id not allowed chat_id=%s", chat_id)
                 return {"status": "ignored"}
 
             mentions = message.get("mentions") or []
             if settings.feishu_analyze_mention_only and not mentions:
+                logger.info("HTTP Feishu event ignored because mention is required chat_id=%s", chat_id)
                 return {"status": "ignored"}
 
             content_text = extract_text_from_message_content(message.get("content"))
             if not content_text.strip():
+                logger.info("HTTP Feishu event ignored empty content chat_id=%s", chat_id)
                 return {"status": "ignored"}
 
             sender_open_id = None
@@ -551,8 +620,17 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             )
             if settings.interactive_topic_enabled:
                 if not thread_root_message_id:
+                    logger.info("HTTP Feishu event ignored missing root message id chat_id=%s", chat_id)
                     return {"status": "ignored", "reason": "missing root message id"}
+                logger.info(
+                    "HTTP Feishu event starts interactive topic chat_id=%s root_message_id=%s content_chars=%s mentions=%s",
+                    chat_id,
+                    thread_root_message_id,
+                    len(content_text),
+                    len(mentions),
+                )
                 task_id = await get_interactive_topic_workflow().start(chat_id, thread_root_message_id, content_text)
+                logger.info("HTTP Feishu event interactive topic started task_id=%s chat_id=%s", task_id, chat_id)
                 return {"status": "ok", "sent_to_feishu": True, "task_id": task_id}
 
             analysis, sent = await run_workflow_and_send(
@@ -573,8 +651,15 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             raise
         except Exception as exc:
             logger.exception("Failed to process Feishu event")
+            monitor.record_error("feishu_api_error")
             report_exception("/feishu/events", exc)
             raise HTTPException(status_code=500, detail="Failed to process Feishu event.") from exc
+
+    @app.get("/metrics")
+    def metrics() -> Response:
+        if not settings.metrics_enabled:
+            raise HTTPException(status_code=404, detail="Metrics are disabled.")
+        return Response(content=monitor.render_latest(), media_type=CONTENT_TYPE_LATEST)
 
     return app
 

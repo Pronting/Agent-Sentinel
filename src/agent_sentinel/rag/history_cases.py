@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,8 @@ from agent_sentinel.graph.state import DiagnosisState
 from agent_sentinel.rag.embedding import EmbeddingClient
 from agent_sentinel.rag.milvus_client import MilvusSearchConfig, MilvusVectorClient
 from agent_sentinel.rag.models import RetrievedDoc
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -28,7 +31,17 @@ class HistoryCaseStore:
         threshold: float | None = None,
     ) -> list[RetrievedDoc]:
         if not alert_text.strip():
+            logger.info("History case search skipped empty alert_text")
             return []
+        started = time.perf_counter()
+        min_score = self.similarity_threshold if threshold is None else threshold
+        logger.info(
+            "History case search start collection=%s alert_chars=%s top_k=%s threshold=%s",
+            self.collection_name,
+            len(alert_text),
+            top_k,
+            min_score,
+        )
         query_embedding = await self.embedding.embed(alert_text)
         docs = await self.milvus.search(
             collection_name=self.collection_name,
@@ -37,10 +50,20 @@ class HistoryCaseStore:
             source_type="message_history",
             expr='doc_type == "alert_case"',
         )
-        min_score = self.similarity_threshold if threshold is None else threshold
-        return [doc for doc in docs if doc.score >= min_score]
+        filtered = [doc for doc in docs if doc.score >= min_score]
+        logger.info(
+            "History case search completed collection=%s recalled=%s filtered=%s threshold=%s scores=%s elapsed_ms=%s",
+            self.collection_name,
+            len(docs),
+            len(filtered),
+            min_score,
+            _format_scores([doc.score for doc in filtered]),
+            int((time.perf_counter() - started) * 1000),
+        )
+        return filtered
 
     async def save_case_to_history(self, state: DiagnosisState) -> str:
+        started = time.perf_counter()
         alert_text = build_alert_text(state.get("raw_alert", {}))
         if not alert_text.strip():
             alert_text = str(state.get("alert_summary") or "AIOps alert case")
@@ -81,6 +104,14 @@ class HistoryCaseStore:
         }
         await self.milvus.ensure_static_doc_collection(self.collection_name, len(embedding))
         await self.milvus.upsert(self.collection_name, [record])
+        logger.info(
+            "History case saved collection=%s case_id=%s alert_chars=%s metadata_bytes=%s elapsed_ms=%s",
+            self.collection_name,
+            case_id,
+            len(alert_text),
+            len(record["metadata"].encode("utf-8")),
+            int((time.perf_counter() - started) * 1000),
+        )
         return case_id
 
 
@@ -194,3 +225,10 @@ def _metadata_json(metadata: dict[str, Any]) -> str:
         {"truncated": _truncate_utf8(raw, 7800)},
         ensure_ascii=False,
     )
+
+
+def _format_scores(scores: list[float], limit: int = 5) -> str:
+    if not scores:
+        return "[]"
+    suffix = ", ..." if len(scores) > limit else ""
+    return "[" + ", ".join(f"{score:.4f}" for score in scores[:limit]) + suffix + "]"

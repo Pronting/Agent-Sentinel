@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any
@@ -22,6 +23,7 @@ from agent_sentinel.feishu.card_handler import HumanDecisionStore
 from agent_sentinel.feishu.sender import FeishuSender
 from agent_sentinel.graph.state import DiagnosisState
 from agent_sentinel.llm.executor import LLMExecutor
+from agent_sentinel.monitoring import monitor, trace_id_from_state
 from agent_sentinel.rag.base import BaseRetriever
 from agent_sentinel.rag.factory import build_retriever
 from agent_sentinel.rag.history_cases import HistoryCaseStore, build_history_case_store
@@ -89,28 +91,54 @@ class DiagnosisWorkflow:
     async def run_streaming(self, initial_state: DiagnosisState) -> DiagnosisState:
         app = self.compile()
         workflow_thread_id = initial_state.get("workflow_thread_id", "")
+        started = time.perf_counter()
         config = {
             "configurable": {"thread_id": workflow_thread_id},
             "recursion_limit": 20,
         }
+        trace_id = trace_id_from_state(initial_state)
+        logger.info(
+            "Diagnosis LangGraph run start trace_id=%s workflow_thread_id=%s workflow_run_id=%s chat_id=%s raw_alert_keys=%s",
+            trace_id,
+            workflow_thread_id,
+            initial_state.get("workflow_run_id"),
+            initial_state.get("chat_id"),
+            sorted((initial_state.get("raw_alert") or {}).keys()),
+        )
         final_state: DiagnosisState = dict(initial_state)
-        async for update in app.astream(
-            initial_state,
-            config=config,
-            stream_mode="updates",
-        ):
-            for node_name, node_update in update.items():
-                if isinstance(node_update, dict):
-                    final_state.update(node_update)
-                await self._send_progress(node_name, final_state)
-        state_snapshot = await app.aget_state(config)
-        final_values = getattr(state_snapshot, "values", None)
-        if isinstance(final_values, dict):
-            final_state.update(final_values)
+        with monitor.track_workflow("diagnosis", initial_state.get("chat_id")):
+            async for update in app.astream(
+                initial_state,
+                config=config,
+                stream_mode="updates",
+            ):
+                for node_name, node_update in update.items():
+                    logger.info(
+                        "Diagnosis LangGraph node update trace_id=%s workflow_thread_id=%s node=%s update_keys=%s",
+                        trace_id,
+                        workflow_thread_id,
+                        node_name,
+                        sorted(node_update.keys()) if isinstance(node_update, dict) else type(node_update).__name__,
+                    )
+                    if isinstance(node_update, dict):
+                        final_state.update(node_update)
+                    await self._send_progress(node_name, final_state)
+            state_snapshot = await app.aget_state(config)
+            final_values = getattr(state_snapshot, "values", None)
+            if isinstance(final_values, dict):
+                final_state.update(final_values)
+        logger.info(
+            "Diagnosis LangGraph run completed trace_id=%s workflow_thread_id=%s final_keys=%s elapsed_ms=%s",
+            trace_id,
+            workflow_thread_id,
+            sorted(final_state.keys()),
+            int((time.perf_counter() - started) * 1000),
+        )
         return final_state
 
     async def resume(self, workflow_thread_id: str, resume_payload: dict[str, Any]) -> DiagnosisState:
         app = self.compile()
+        started = time.perf_counter()
         config = {
             "configurable": {"thread_id": workflow_thread_id},
             "recursion_limit": 20,
@@ -120,19 +148,42 @@ class DiagnosisWorkflow:
         values = getattr(state_snapshot, "values", None)
         if isinstance(values, dict):
             final_state.update(values)
-        async for update in app.astream(
-            Command(resume=resume_payload),
-            config=config,
-            stream_mode="updates",
-        ):
-            for node_name, node_update in update.items():
-                if isinstance(node_update, dict):
-                    final_state.update(node_update)
-                await self._send_progress(node_name, final_state)
-        state_snapshot = await app.aget_state(config)
-        final_values = getattr(state_snapshot, "values", None)
-        if isinstance(final_values, dict):
-            final_state.update(final_values)
+        trace_id = trace_id_from_state(final_state)
+        logger.info(
+            "Diagnosis LangGraph resume start trace_id=%s workflow_thread_id=%s resume_keys=%s existing_keys=%s",
+            trace_id,
+            workflow_thread_id,
+            sorted(resume_payload.keys()),
+            sorted(final_state.keys()),
+        )
+        with monitor.track_workflow("diagnosis_resume", final_state.get("chat_id")):
+            async for update in app.astream(
+                Command(resume=resume_payload),
+                config=config,
+                stream_mode="updates",
+            ):
+                for node_name, node_update in update.items():
+                    logger.info(
+                        "Diagnosis LangGraph resume node update trace_id=%s workflow_thread_id=%s node=%s update_keys=%s",
+                        trace_id,
+                        workflow_thread_id,
+                        node_name,
+                        sorted(node_update.keys()) if isinstance(node_update, dict) else type(node_update).__name__,
+                    )
+                    if isinstance(node_update, dict):
+                        final_state.update(node_update)
+                    await self._send_progress(node_name, final_state)
+            state_snapshot = await app.aget_state(config)
+            final_values = getattr(state_snapshot, "values", None)
+            if isinstance(final_values, dict):
+                final_state.update(final_values)
+        logger.info(
+            "Diagnosis LangGraph resume completed trace_id=%s workflow_thread_id=%s final_keys=%s elapsed_ms=%s",
+            trace_id,
+            workflow_thread_id,
+            sorted(final_state.keys()),
+            int((time.perf_counter() - started) * 1000),
+        )
         return final_state
 
     async def update_state(self, workflow_thread_id: str, state_update: dict[str, Any]) -> None:
@@ -143,7 +194,7 @@ class DiagnosisWorkflow:
         )
 
     def _node_registry(self) -> dict[str, NodeFn]:
-        return {
+        registry = {
             "understand": partial(
                 understand_node,
                 llm=self.llm,
@@ -174,6 +225,18 @@ class DiagnosisWorkflow:
                 enabled=self.settings.rag_feedback_enabled,
             ),
         }
+        return {name: self._track_node(name, node) for name, node in registry.items()}
+
+    def _track_node(self, node_name: str, node: NodeFn) -> NodeFn:
+        async def wrapped(state: DiagnosisState) -> DiagnosisState:
+            trace_id = trace_id_from_state(state)
+            logger.info("Diagnosis node execution start trace_id=%s node=%s", trace_id, node_name)
+            with monitor.track_node(node_name, state.get("chat_id")):
+                result = await node(state)
+            logger.info("Diagnosis node execution completed trace_id=%s node=%s", trace_id, node_name)
+            return result
+
+        return wrapped
 
     def _route_registry(self) -> dict[str, Callable[[DiagnosisState], str]]:
         return {

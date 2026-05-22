@@ -19,6 +19,7 @@ class DiagnosisState(TypedDict, total=False):
     mention_name: str | None
     workflow_thread_id: str
     workflow_run_id: str
+    trace_id: str
     decision_id: str
     human_card_sent: bool
     human_feedback: str | None

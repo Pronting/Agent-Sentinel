@@ -56,7 +56,12 @@ class FeishuMessagePoller:
 
     def _run_forever(self) -> None:
         interval = max(self.settings.feishu_message_polling_interval_seconds, 2)
-        logger.info("Starting Feishu message polling loop.")
+        logger.info(
+            "Starting Feishu message polling loop interval_seconds=%s chats=%s page_size=%s",
+            interval,
+            len(self.settings.feishu_allowed_chat_ids),
+            self.settings.feishu_message_polling_page_size,
+        )
         while True:
             try:
                 for chat_id in self.settings.feishu_allowed_chat_ids:
@@ -66,49 +71,61 @@ class FeishuMessagePoller:
             time.sleep(interval)
 
     def _poll_chat(self, chat_id: str) -> None:
+        started = time.perf_counter()
         items = self.feishu_bot_client.list_chat_messages(
             chat_id,
             page_size=max(self.settings.feishu_message_polling_page_size, 1),
         )
-        logger.debug("Polled Feishu messages chat_id=%s count=%s", chat_id, len(items))
+        logger.info(
+            "Polled Feishu messages chat_id=%s count=%s elapsed_ms=%s",
+            chat_id,
+            len(items),
+            int((time.perf_counter() - started) * 1000),
+        )
         for message in reversed(items):
             self._handle_message(chat_id, message)
 
     def _handle_message(self, chat_id: str, message: dict[str, object]) -> None:
         message_id = str(message.get("message_id") or "")
         if not message_id:
+            logger.info("Feishu polled message ignored missing message_id chat_id=%s", chat_id)
             return
         if self._already_seen(message_id):
+            logger.info("Feishu polled message ignored duplicate message_id=%s chat_id=%s", message_id, chat_id)
             return
 
         if str(message.get("msg_type") or "") != "text":
+            logger.info("Feishu polled message ignored msg_type=%s message_id=%s", message.get("msg_type"), message_id)
             return
 
         sender = message.get("sender") or {}
         if isinstance(sender, dict):
             sender_type = str(sender.get("sender_type") or "")
             if sender_type and sender_type != "user":
+                logger.info("Feishu polled message ignored sender_type=%s message_id=%s", sender_type, message_id)
                 return
 
         raw_content = message.get("body") or message.get("content") or ""
         content_text = self._extract_text(raw_content)
         if not content_text.strip():
+            logger.info("Feishu polled message ignored empty content message_id=%s chat_id=%s", message_id, chat_id)
             return
 
         mentions = message.get("mentions") or []
         if self.settings.feishu_analyze_mention_only and not self._looks_like_bot_mention(content_text, mentions):
-            logger.debug(
-                "Feishu polled message skipped because it does not mention bot message_id=%s content=%s",
+            logger.info(
+                "Feishu polled message skipped because it does not mention bot message_id=%s content_chars=%s",
                 message_id,
-                content_text[:120],
+                len(content_text),
             )
             return
 
         logger.info(
-            "Feishu polled message routed to LangGraph message_id=%s chat_id=%s content=%s",
+            "Feishu polled message routed to analysis message_id=%s chat_id=%s root_message_id=%s content_chars=%s",
             message_id,
             chat_id,
-            content_text[:120],
+            str(message.get("root_id") or "") or message_id,
+            len(content_text),
         )
         self.analyze_callback(
             chat_id,
