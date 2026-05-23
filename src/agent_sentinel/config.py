@@ -118,6 +118,28 @@ class Settings:
     interactive_topic_enabled: bool = True
     interactive_topic_wait_seconds: int = 5
 
+    # Tools provider 配置
+    tools_provider: str = "mock"  # mock | aliyun
+    tools_metrics_enabled: bool = True
+    tools_logs_enabled: bool = True
+    tools_topology_enabled: bool = True
+
+    # 阿里云 SLS 配置
+    aliyun_sls_access_key_id: str | None = None
+    aliyun_sls_access_key_secret: str | None = None
+    aliyun_sls_endpoint: str = "cn-hangzhou.log.aliyuncs.com"
+    aliyun_sls_project: str = ""
+    aliyun_sls_logstore: str = ""
+    aliyun_sls_query_timeout_seconds: int = 10
+    aliyun_sls_max_lines: int = 100
+
+    # 阿里云 ARMS 配置
+    aliyun_arms_access_key_id: str | None = None
+    aliyun_arms_access_key_secret: str | None = None
+    aliyun_arms_region_id: str = "cn-hangzhou"
+    aliyun_arms_app_id: str = ""
+    aliyun_arms_query_timeout_seconds: int = 10
+
 
 def get_settings() -> Settings:
     load_dotenv()
@@ -134,6 +156,9 @@ def get_settings() -> Settings:
         else {}
     )
     embedding_cfg = yaml_settings.get("embedding", {})
+    tools_cfg = yaml_settings.get("tools", {}) if isinstance(yaml_settings.get("tools", {}), dict) else {}
+    sls_cfg = tools_cfg.get("aliyun_sls", {}) if isinstance(tools_cfg.get("aliyun_sls", {}), dict) else {}
+    arms_cfg = tools_cfg.get("aliyun_arms", {}) if isinstance(tools_cfg.get("aliyun_arms", {}), dict) else {}
     return Settings(
         app_name=os.getenv("APP_NAME", str(app_cfg.get("name", "Agent Sentinel"))),
         app_host=os.getenv("APP_HOST", str(app_cfg.get("host", "0.0.0.0"))),
@@ -284,6 +309,49 @@ def get_settings() -> Settings:
         ),
         interactive_topic_enabled=_to_bool(os.getenv("INTERACTIVE_TOPIC_ENABLED"), True),
         interactive_topic_wait_seconds=_to_int(os.getenv("INTERACTIVE_TOPIC_WAIT_SECONDS"), 5),
+        # Tools provider 配置
+        tools_provider=os.getenv("TOOLS_PROVIDER", str(tools_cfg.get("provider", "mock"))),
+        tools_metrics_enabled=_to_bool(
+            os.getenv("TOOLS_METRICS_ENABLED"),
+            bool(tools_cfg.get("metrics_enabled", True)),
+        ),
+        tools_logs_enabled=_to_bool(
+            os.getenv("TOOLS_LOGS_ENABLED"),
+            bool(tools_cfg.get("logs_enabled", True)),
+        ),
+        tools_topology_enabled=_to_bool(
+            os.getenv("TOOLS_TOPOLOGY_ENABLED"),
+            bool(tools_cfg.get("topology_enabled", True)),
+        ),
+        # 阿里云 SLS 配置
+        aliyun_sls_access_key_id=os.getenv("ALIYUN_SLS_ACCESS_KEY_ID", sls_cfg.get("access_key_id")),
+        aliyun_sls_access_key_secret=os.getenv("ALIYUN_SLS_ACCESS_KEY_SECRET", sls_cfg.get("access_key_secret")),
+        aliyun_sls_endpoint=os.getenv(
+            "ALIYUN_SLS_ENDPOINT",
+            str(sls_cfg.get("endpoint", "cn-hangzhou.log.aliyuncs.com")),
+        ),
+        aliyun_sls_project=os.getenv("ALIYUN_SLS_PROJECT", str(sls_cfg.get("project", ""))),
+        aliyun_sls_logstore=os.getenv("ALIYUN_SLS_LOGSTORE", str(sls_cfg.get("logstore", ""))),
+        aliyun_sls_query_timeout_seconds=_to_int(
+            os.getenv("ALIYUN_SLS_QUERY_TIMEOUT_SECONDS"),
+            int(sls_cfg.get("query_timeout_seconds", 10)),
+        ),
+        aliyun_sls_max_lines=_to_int(
+            os.getenv("ALIYUN_SLS_MAX_LINES"),
+            int(sls_cfg.get("max_lines", 100)),
+        ),
+        # 阿里云 ARMS 配置
+        aliyun_arms_access_key_id=os.getenv("ALIYUN_ARMS_ACCESS_KEY_ID", arms_cfg.get("access_key_id")),
+        aliyun_arms_access_key_secret=os.getenv("ALIYUN_ARMS_ACCESS_KEY_SECRET", arms_cfg.get("access_key_secret")),
+        aliyun_arms_region_id=os.getenv(
+            "ALIYUN_ARMS_REGION_ID",
+            str(arms_cfg.get("region_id", "cn-hangzhou")),
+        ),
+        aliyun_arms_app_id=os.getenv("ALIYUN_ARMS_APP_ID", str(arms_cfg.get("app_id", ""))),
+        aliyun_arms_query_timeout_seconds=_to_int(
+            os.getenv("ALIYUN_ARMS_QUERY_TIMEOUT_SECONDS"),
+            int(arms_cfg.get("query_timeout_seconds", 10)),
+        ),
     )
 
 
