@@ -19,7 +19,53 @@ class MockMetricsProvider:
             logger.info("Fetching mock metrics summary_chars=%s", len(alert_summary))
             await asyncio.sleep(0.05)
             monitor.record_tool_call("get_metrics", group_id)
-            return {"latency_p95_ms": 1850, "error_rate": 0.087, "cpu_usage": 0.64}
+            return {
+                # 应用概览指标
+                "qps": 1250.5,
+                "latency_p95_ms": 1850,
+                "latency_avg_ms": 450,
+                "error_rate": 0.087,
+                "error_count": 108,
+                "total_requests": 125000,
+                "cpu_usage": 0.64,
+                "memory_usage": 0.72,
+                # JVM 指标
+                "jvm_heap_used_mb": 512,
+                "jvm_non_heap_used_mb": 128,
+                "jvm_gc_count": 45,
+                # 线程池指标
+                "thread_active_count": 45,
+                "thread_pool_size": 100,
+                # 告警信息
+                "alerts": [
+                    {
+                        "alert_name": "订单同步超时",
+                        "severity": "错误",
+                        "status": "已触发",
+                        "start_time": 1716441600000,
+                        "end_time": None,
+                        "message": "order-sync timeout after 3 retries",
+                        "tags": {"service": "order-sync", "env": "production"},
+                    },
+                    {
+                        "alert_name": "支付接口响应慢",
+                        "severity": "警告",
+                        "status": "已触发",
+                        "start_time": 1716441500000,
+                        "end_time": None,
+                        "message": "payment-api response time > 3s",
+                        "tags": {"service": "payment-api", "env": "production"},
+                    },
+                ],
+                "alert_count": 2,
+                # 健康状态
+                "health_status": "UNHEALTHY",
+                "bottlenecks": [
+                    "错误率过高: 8.70%",
+                    "P95 延迟过高: 1850ms",
+                ],
+                "provider": "mock",
+            }
 
 
 class MockLogsProvider:
@@ -33,9 +79,55 @@ class MockLogsProvider:
             monitor.record_tool_call("query_logs", group_id)
             return {
                 "matches": [
-                    "ERROR order-sync timeout after 3 retries",
-                    "WARN downstream payment-api slow response",
-                ]
+                    {
+                        "timestamp": 1716441600,
+                        "level": "ERROR",
+                        "service": "order-sync",
+                        "message": "timeout after 3 retries, downstream payment-api unavailable",
+                        "trace_id": "abc123def456",
+                    },
+                    {
+                        "timestamp": 1716441590,
+                        "level": "WARN",
+                        "service": "payment-api",
+                        "message": "slow response detected, latency > 3000ms",
+                        "trace_id": "abc123def457",
+                    },
+                    {
+                        "timestamp": 1716441580,
+                        "level": "ERROR",
+                        "service": "order-sync",
+                        "message": "connection pool exhausted, max_connections=50",
+                        "trace_id": "abc123def458",
+                    },
+                    {
+                        "timestamp": 1716441570,
+                        "level": "INFO",
+                        "service": "order-sync",
+                        "message": "retrying connection attempt 3/3",
+                        "trace_id": "abc123def458",
+                    },
+                    {
+                        "timestamp": 1716441560,
+                        "level": "ERROR",
+                        "service": "redis-cache",
+                        "message": "READONLY You can't write against a read only replica",
+                        "trace_id": "abc123def459",
+                    },
+                ],
+                "total": 5,
+                "level_stats": {
+                    "ERROR": 3,
+                    "WARN": 1,
+                    "INFO": 1,
+                },
+                "error_messages": [
+                    "timeout after 3 retries, downstream payment-api unavailable",
+                    "connection pool exhausted, max_connections=50",
+                    "READONLY You can't write against a read only replica",
+                ],
+                "query": 'level: ERROR AND service: "order-sync"',
+                "provider": "mock",
             }
 
 

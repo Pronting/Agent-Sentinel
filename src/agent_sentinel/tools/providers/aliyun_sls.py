@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -9,6 +10,18 @@ from agent_sentinel.monitoring import monitor
 from agent_sentinel.utils.retry_utils import async_retry
 
 logger = logging.getLogger(__name__)
+
+# 日志级别关键词
+LOG_LEVELS = ["ERROR", "WARN", "WARNING", "FATAL", "CRITICAL", "EXCEPTION", "EXCEPTION"]
+
+# 常见服务名模式
+SERVICE_PATTERNS = [
+    r"[\w-]+-service",
+    r"[\w-]+-api",
+    r"[\w-]+-sync",
+    r"[\w-]+-worker",
+    r"[\w-]+-consumer",
+]
 
 
 class AliyunSLSClient:
@@ -102,10 +115,24 @@ class AliyunSLSClient:
 
                 logs = []
                 for log in result.get_log_lines():
-                    logs.append({
+                    # 解析日志内容
+                    contents = log.get_contents()
+                    log_entry = {
                         "timestamp": log.get_time(),
-                        "content": log.get_contents(),
-                    })
+                        "content": contents,
+                    }
+
+                    # 提取常见字段
+                    if isinstance(contents, dict):
+                        log_entry["level"] = contents.get("level", contents.get("severity", ""))
+                        log_entry["service"] = contents.get("service", contents.get("app", ""))
+                        log_entry["message"] = contents.get("message", contents.get("msg", ""))
+                        log_entry["trace_id"] = contents.get("trace_id", contents.get("traceId", ""))
+                        log_entry["span_id"] = contents.get("span_id", contents.get("spanId", ""))
+                    else:
+                        log_entry["message"] = str(contents)
+
+                    logs.append(log_entry)
                 return logs
 
         except LogException as e:
@@ -130,38 +157,146 @@ class SLSLogsProvider:
             group_id: 飞书群组 ID（可用于映射到不同的 project/logstore）
 
         Returns:
-            包含 matches 列表的字典
+            包含 matches 列表和统计信息的字典
         """
         logger.info("Querying SLS logs summary_chars=%s group_id=%s", len(alert_summary), group_id)
 
         # 构建查询语句
         query = self._build_query(alert_summary)
+        logger.info("SLS query: %s", query)
 
         # 查询日志（重试已在 AliyunSLSClient.query_logs 中处理）
         logs = await self._client.query_logs(query=query)
 
         monitor.record_tool_call("query_logs", group_id)
 
+        # 统计日志级别分布
+        level_stats = {}
+        for log in logs:
+            level = log.get("level", "UNKNOWN")
+            level_stats[level] = level_stats.get(level, 0) + 1
+
+        # 提取错误消息
+        error_messages = []
+        for log in logs:
+            level = log.get("level", "").upper()
+            if level in ["ERROR", "FATAL", "CRITICAL", "EXCEPTION"]:
+                error_messages.append(log.get("message", str(log.get("content", ""))))
+
         return {
             "matches": [
-                log.get("content", {}).get("message", log.get("content", {}).get("__content__", str(log)))
+                {
+                    "timestamp": log.get("timestamp"),
+                    "level": log.get("level", ""),
+                    "service": log.get("service", ""),
+                    "message": log.get("message", str(log.get("content", ""))),
+                    "trace_id": log.get("trace_id", ""),
+                }
                 for log in logs
             ],
             "total": len(logs),
+            "level_stats": level_stats,
+            "error_messages": error_messages[:5],  # 最多返回 5 条错误消息
+            "query": query,
             "provider": "aliyun_sls",
         }
 
     def _build_query(self, alert_summary: str) -> str:
         """根据告警摘要构建 SLS 查询语句
 
-        从告警摘要中提取关键词，构建 OR 查询。
+        智能分析告警摘要，提取日志级别、服务名和关键词，构建高效的查询语句。
+
+        Args:
+            alert_summary: 告警摘要文本
+
+        Returns:
+            SLS 查询语句（LOGQL 语法）
         """
-        # 提取关键词（简单实现：按空格分割，取前 5 个长度 > 2 的词）
-        keywords = [kw for kw in alert_summary.split() if len(kw) > 2][:5]
+        # 提取日志级别
+        log_level = self._extract_log_level(alert_summary)
 
-        if not keywords:
-            return "* AND ERROR"
+        # 提取服务名
+        service_name = self._extract_service_name(alert_summary)
 
-        # 构建 SLS 查询：关键词用 OR 连接
-        query_parts = [f'"{kw}"' for kw in keywords]
-        return " OR ".join(query_parts)
+        # 提取关键词
+        keywords = self._extract_keywords(alert_summary)
+
+        # 构建查询条件
+        conditions = []
+
+        # 添加日志级别条件
+        if log_level:
+            conditions.append(f'level: {log_level}')
+
+        # 添加服务名条件
+        if service_name:
+            conditions.append(f'service: "{service_name}"')
+
+        # 添加关键词条件
+        if keywords:
+            keyword_query = " OR ".join([f'"{kw}"' for kw in keywords[:3]])
+            conditions.append(f'({keyword_query})')
+
+        # 组合查询条件
+        if not conditions:
+            return '* AND (level: ERROR OR level: WARN)'
+
+        if len(conditions) == 1:
+            return conditions[0]
+
+        return " AND ".join(conditions)
+
+    def _extract_log_level(self, text: str) -> str | None:
+        """从文本中提取日志级别"""
+        text_upper = text.upper()
+        for level in LOG_LEVELS:
+            if level in text_upper:
+                return level
+        return None
+
+    def _extract_service_name(self, text: str) -> str | None:
+        """从文本中提取服务名"""
+        for pattern in SERVICE_PATTERNS:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(0)
+        return None
+
+    def _extract_keywords(self, text: str) -> list[str]:
+        """从文本中提取关键词
+
+        过滤停用词，提取有意义的关键词。
+        """
+        # 停用词列表
+        stop_words = {
+            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
+            "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好",
+            "自己", "这", "他", "她", "它", "们", "那", "被", "从", "把", "让", "用", "对",
+            "等", "但", "而", "如果", "虽然", "因为", "所以", "这个", "那个", "什么", "怎么",
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+            "on", "with", "at", "by", "from", "as", "into", "through", "during",
+            "before", "after", "above", "below", "between", "out", "off", "over",
+            "under", "again", "further", "then", "once", "and", "but", "or",
+            "nor", "not", "so", "very", "just", "than", "too", "also",
+        }
+
+        # 提取单词（支持中英文）
+        words = re.findall(r'[\w\u4e00-\u9fff]+', text)
+
+        # 过滤停用词和短词
+        keywords = [
+            word for word in words
+            if len(word) > 2 and word.lower() not in stop_words
+        ]
+
+        # 去重并限制数量
+        seen = set()
+        result = []
+        for kw in keywords:
+            if kw.lower() not in seen:
+                seen.add(kw.lower())
+                result.append(kw)
+
+        return result[:5]
