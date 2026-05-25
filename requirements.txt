@@ -17,3 +17,8 @@ lark-oapi>=1.4.18
 prometheus-client>=0.21.0
 httpx>=0.28.0
 pytest>=8.3.0
+
+# 阿里云监控集成（可选）
+aliyun-log-python-sdk>=0.8.0  # SLS 日志服务
+alibabacloud-arms20190808>=2.0.0  # ARMS 应用监控
+alibabacloud-tea-openapi>=0.3.0  # 阿里云 OpenAPI 基础库
